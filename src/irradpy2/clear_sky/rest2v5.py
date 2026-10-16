@@ -3,6 +3,21 @@ import pandas as pd
 
 
 def datetime_convert(datetime):
+    """Convert a datetime sequence to (day-of-year, year) arrays.
+
+    Parameters
+    ----------
+    datetime : array-like
+        Datetime sequence parsed with ``pandas.to_datetime``; invalid entries
+        become NaT. The original array shape is preserved.
+
+    Returns
+    -------
+    Dayth : numpy.ndarray of float
+        Day of year (1-366), same shape as ``datetime``.
+    Year : numpy.ndarray of float
+        Calendar year, same shape as ``datetime``.
+    """
     datetime_array = np.asarray(datetime)
     original_shape = datetime_array.shape
     datetime_flat = datetime_array.reshape(-1)
@@ -26,10 +41,8 @@ def rest2v5(sza: np.ndarray, datetime: np.ndarray, press: np.ndarray, albedo: np
     ----------
     sza : np.ndarray
         Solar zenith angle [radians]
-    Dayth : np.ndarray
-        Day number ranging from 1 to 365
-    Year : np.ndarray
-        Year
+    datetime : np.ndarray
+        Datetime data; day of year and year are derived from it internally
     press : np.ndarray
         Local barometric pressure [mb]
     albedo : np.ndarray

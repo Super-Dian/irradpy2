@@ -1129,8 +1129,7 @@ Original modified Iqbal-C clear-sky model.
 **Parameters**
 
 - `sza` (*np.ndarray*) — Solar zenith angle [radians]
-- `Dayth` (*np.ndarray*) — Day number ranging from 1 to 365
-- `Year` (*np.ndarray*) — Year
+- `datetime` (*np.ndarray*) — Datetime data; day of year and year are derived from it internally
 - `altitude` (*np.ndarray*) — Location altitude [m]
 - `albedo` (*np.ndarray*) — Surface/ground albedo
 - `ang_alpha` (*np.ndarray*) — Angstrom exponent
@@ -1336,8 +1335,7 @@ Original REST2 version 5 clear-sky model.
 **Parameters**
 
 - `sza` (*np.ndarray*) — Solar zenith angle [radians]
-- `Dayth` (*np.ndarray*) — Day number ranging from 1 to 365
-- `Year` (*np.ndarray*) — Year
+- `datetime` (*np.ndarray*) — Datetime data; day of year and year are derived from it internally
 - `press` (*np.ndarray*) — Local barometric pressure [mb]
 - `albedo` (*np.ndarray*) — Surface/ground albedo
 - `ang_alpha` (*np.ndarray*) — Angstrom exponent
