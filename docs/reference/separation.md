@@ -78,6 +78,21 @@ Engerer2 irradiance separation model.
 
 ### `erbs(ghi, datetime, lat, lon)`
 
+Erbs irradiance separation model.  The clearness index kt = GHI / extraterrestrial horizontal irradiance is clipped to [0, 1] and mapped to the diffuse fraction kd with the piecewise Erbs correlation (linear below kt = 0.22, quartic up to kt = 0.8, constant 0.165 above). DHI = GHI * kd; DNI is recovered as (GHI - DHI) / cos(zenith) only where the zenith angle is below 87 degrees, otherwise it is set to 0 and the missing fraction is assigned to DHI.
+
+**Parameters**
+
+- `ghi` (*numpy.ndarray*) — Global horizontal irradiance [W/m^2], with shape (N,) or (N, 1).
+- `datetime` (*numpy.ndarray*) — UTC datetime values with length N.
+- `lat` (*float*) — Site latitude [degrees].
+- `lon` (*float*) — Site longitude [degrees].
+
+**Returns**
+
+- `kd` (*numpy.ndarray*) — Diffuse fraction with shape (N, 1).
+- `dhi` (*numpy.ndarray*) — Diffuse horizontal irradiance [W/m^2] with shape (N, 1).
+- `dni` (*numpy.ndarray*) — Direct normal irradiance [W/m^2] with shape (N, 1).
+
 ### `louche(ghi, datetime, lat, lon)`
 
 Louche irradiance separation model.
