@@ -184,6 +184,31 @@ def _default_area_prefix(lat_1: float, lon_1: float, lat_2: float, lon_2: float)
 
 
 def read_cams_point_csv(csv_path: str | Path, map_variables: bool = True) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Parse a CAMS point CSV file into a time-indexed DataFrame.
+
+    Parameters
+    ----------
+    csv_path : str or pathlib.Path
+        Path to the downloaded CAMS CSV (semicolon-separated with a
+        ``# Observation period`` header line).
+    map_variables : bool, default True
+        Rename columns to standard names (``ghi``, ``dni``, ``dhi``,
+        ``ghi_clear``, ...) via ``VARIABLE_MAP``.
+
+    Returns
+    -------
+    data : pandas.DataFrame
+        Table indexed by UTC timestamps (observation-period column dropped).
+    metadata : dict
+        ``source_file``, ``row_count`` and, when non-empty, ``start_utc``/
+        ``end_utc``.
+
+    Raises
+    ------
+    ValueError
+        When the CAMS header line or the observation-period column is missing.
+    """
     csv_path = Path(csv_path)
 
     with open(csv_path, "r", encoding="utf-8") as f:
@@ -270,6 +295,50 @@ def _build_area_request(year: int, month: int, variable: str, sky_type: str, are
 
 
 def download_cams_point(lat: float, lon: float, start: Any, end: Any, save_path: Optional[str | Path] = None, file_format: str = "csv", sky_type: str = "observed_cloud", time_step: str = "1min", time_ref: str = "UT", altitude: Optional[float] = None, quiet: bool = True, parse_csv: bool = True, map_variables: bool = True, api_url: Optional[str] = None, api_key: Optional[str] = None) -> CamsPointResult:
+    """
+    Download CAMS satellite-derived radiation for one point from the ADS API.
+
+    Parameters
+    ----------
+    lat : float
+        Latitude [degrees].
+    lon : float
+        Longitude [degrees].
+    start : Any
+        Start of the period; anything `pandas.Timestamp` accepts, converted to UTC (tz-aware values are converted, naive values are taken as-is).
+    end : Any
+        End of the period (same parsing as `start`); must not precede `start` (`ValueError`).
+    save_path : str or pathlib.Path, optional
+        Output path; defaults to `cams_<lat>_<lon>_<start>_<end>.csv`. The suffix follows `file_format` (`.csv` or `.nc`).
+    file_format : str, default "csv"
+        `"csv"` or `"netcdf"` (`ValueError` otherwise).
+    sky_type : str, default "observed_cloud"
+        `"clear"` or `"observed_cloud"` (`ValueError` otherwise).
+    time_step : str, default "1min"
+        One of `"1min"`, `"15min"`, `"1h"`, `"1d"`, `"1M"` (`ValueError` otherwise).
+    time_ref : str, default "UT"
+        `"UT"` (universal time) or `"TST"` (true solar time) (`ValueError` otherwise).
+    altitude : float, optional
+        Site altitude [m]; when `None` the service default (-999) is sent.
+    quiet : bool, default True
+        Suppress `cdsapi` client progress output.
+    parse_csv : bool, default True
+        CSV only: parse the download, standardize it and rewrite it with a leading `UTC_time` column. Ignored for NetCDF (`data` stays `None`).
+    map_variables : bool, default True
+        Rename parsed columns to standard names (`ghi`, `dni`, `dhi`, `ghi_clear`, ...) via `VARIABLE_MAP`.
+    api_url : str, optional
+        ADS API endpoint override.
+    api_key : str, optional
+        ADS API key override.
+
+    Returns
+    -------
+    CamsPointResult dataclass — `data` (pandas.DataFrame when parsed, else `None`), `metadata` (dict), `data_path`, `metadata_path` (pathlib.Path). A `<stem>_metadata.json` sidecar is written.
+
+    Notes
+    -----
+    A parsed CSV is rewritten in place with columns ordered `UTC_time`, then GHI/DNI/DHI (observed and clear-sky), then the rest. Uses the CDS `cdsapi` client: passing only `api_key` targets the public endpoint (CDS for ERA5, ADS for CAMS); otherwise settings come from `~/.cdsapirc`, with `api_url`/`api_key` overriding individual values.
+    """
     start_ts = _to_utc_naive_timestamp(start)
     end_ts = _to_utc_naive_timestamp(end)
 
@@ -323,6 +392,46 @@ def download_cams_point(lat: float, lon: float, start: Any, end: Any, save_path:
 
 
 def download_cams_area(lat_1: Optional[float] = None, lon_1: Optional[float] = None, lat_2: Optional[float] = None, lon_2: Optional[float] = None, start: Any = None, end: Any = None, variables: Optional[Sequence[str]] = None, sky_type: str = "observed_cloud", output_dir: str | Path = "CAMS_data", quiet: bool = True, file_prefix: Optional[str] = None, api_url: Optional[str] = None, api_key: Optional[str] = None) -> CamsAreaResult:
+    """
+    Download CAMS gridded satellite radiation for a period as NetCDF files (one per variable and month).
+
+    Parameters
+    ----------
+    lat_1 : float, optional
+        Corner latitude [degrees]. When any of the four corners is `None` the whole-domain request is used (no area restriction); when all four are given they are sorted internally to [north, west, south, east].
+    lon_1 : float, optional
+        Corner longitude [degrees]; see `lat_1`.
+    lat_2 : float, optional
+        Corner latitude [degrees]; see `lat_1`.
+    lon_2 : float, optional
+        Corner longitude [degrees]; see `lat_1`.
+    start : Any
+        Start of the period; required (`ValueError` when `None`).
+    end : Any
+        End of the period; required; must not precede `start` (`ValueError`).
+    variables : sequence of str, optional
+        Local aliases (`ghi`, `dni`, `dhi`, `bhi`) resolved via `AREA_VARIABLE_MAP`; defaults to `["ghi", "dni", "dhi"]`.
+    sky_type : str, default "observed_cloud"
+        `"clear"` or `"observed_cloud"` (`ValueError` otherwise).
+    output_dir : str or pathlib.Path, default "CAMS_data"
+        Directory for NetCDF parts and metadata (created if missing).
+    file_prefix : str, optional
+        Output file prefix; defaults to `cams_area_<corners>` when an area is given, else `cams_area`.
+    quiet : bool, default True
+        Suppress `cdsapi` client progress output.
+    api_url : str, optional
+        ADS API endpoint override.
+    api_key : str, optional
+        ADS API key override.
+
+    Returns
+    -------
+    CamsAreaResult dataclass — `netcdf_paths` (list of pathlib.Path), `metadata` (dict), `metadata_path`. A `<prefix>_metadata.json` sidecar is written.
+
+    Notes
+    -----
+    One retrieve is issued per variable and calendar month. Uses the CDS `cdsapi` client: passing only `api_key` targets the public endpoint (CDS for ERA5, ADS for CAMS); otherwise settings come from `~/.cdsapirc`, with `api_url`/`api_key` overriding individual values.
+    """
     if start is None or end is None:
         raise ValueError("start and end must be provided in area mode.")
 
@@ -380,6 +489,30 @@ def download_cams_area(lat_1: Optional[float] = None, lon_1: Optional[float] = N
 
 
 def download_cams(mode: str = "point", quiet: bool = True, api_url: Optional[str] = None, api_key: Optional[str] = None, **kwargs: Any) -> CamsPointResult | CamsAreaResult:
+    """
+    Unified CAMS entry point; dispatches to the point or area downloader by `mode`.
+
+    Parameters
+    ----------
+    mode : str, default "point"
+        `"point"` or `"area"` (case-insensitive; `ValueError` otherwise).
+    quiet : bool, default True
+        Suppress `cdsapi` client progress output.
+    api_url : str, optional
+        ADS API endpoint override.
+    api_key : str, optional
+        ADS API key override.
+    **kwargs : keyword arguments
+        `mode="point"` requires `lat`, `lon`, `start`, `end` (optional `save_path`, `file_format`, `sky_type`, `time_step`, `time_ref`, `altitude`, `parse_csv`, `map_variables`); `mode="area"` requires `start`, `end` (optional `lat_1`, `lon_1`, `lat_2`, `lon_2`, `variables`, `sky_type`, `output_dir`, `file_prefix`). Missing required keys raise `ValueError`.
+
+    Returns
+    -------
+    CamsPointResult or CamsAreaResult — whichever dataclass the selected downloader returns.
+
+    Notes
+    -----
+    Uses the CDS `cdsapi` client: passing only `api_key` targets the public endpoint (CDS for ERA5, ADS for CAMS); otherwise settings come from `~/.cdsapirc`, with `api_url`/`api_key` overriding individual values.
+    """
     mode = mode.lower().strip()
 
     if mode == "point":
