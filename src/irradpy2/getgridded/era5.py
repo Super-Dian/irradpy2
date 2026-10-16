@@ -288,6 +288,33 @@ def _default_area_prefix(lat_1: float, lon_1: float, lat_2: float, lon_2: float)
 # -----------------------------------------------------------------------------
 
 def read_era5_point_csv(csv_path: str | Path, map_variables: bool = True, convert_units: bool = True) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Parse an ERA5 point CSV file into a time-indexed DataFrame.
+
+    Parameters
+    ----------
+    csv_path : str or pathlib.Path
+        Path to the raw CDS CSV export.
+    map_variables : bool, default True
+        Rename columns to standard names (``ghi``, ``longwave_down``,
+        ``temp_air``, ``pressure``, ...) via ``OUTPUT_VARIABLE_MAP``.
+    convert_units : bool, default True
+        Apply unit conversions (e.g. K -> degC, m -> mm).
+
+    Returns
+    -------
+    data : pandas.DataFrame
+        Table indexed by UTC timestamps from the ``valid_time``/``time``
+        column (latitude/longitude columns dropped).
+    metadata : dict
+        ``source_file``, ``row_count``, coordinates when present, and the
+        time coverage.
+
+    Raises
+    ------
+    ValueError
+        When no ``valid_time`` or ``time`` column is found.
+    """
     csv_path = Path(csv_path)
     df = pd.read_csv(csv_path)
 
@@ -336,6 +363,42 @@ def read_era5_point_csv(csv_path: str | Path, map_variables: bool = True, conver
 # -----------------------------------------------------------------------------
 
 def download_era5_point(lat: float, lon: float, start: Any, end: Any, variables: Optional[Sequence[str]] = None, save_path: Optional[str | Path] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = True, map_variables: bool = True, convert_units: bool = True) -> PointResult:
+    """
+    Download ERA5 reanalysis for one point from the CDS API and write it to CSV.
+
+    Parameters
+    ----------
+    lat : float
+        Latitude [degrees].
+    lon : float
+        Longitude [degrees].
+    start : Any
+        Start of the period; anything `pandas.Timestamp` accepts, converted to UTC (tz-aware values are converted, naive values are taken as-is).
+    end : Any
+        End of the period (same parsing as `start`); must not precede `start` (`ValueError`).
+    variables : sequence of str, optional
+        CDS variable names or local aliases (`ghi`, `temp_air`, ... resolved via `INPUT_VARIABLE_MAP`); defaults to `["ssrd", "strd", "t2m", "sp", "tcc", "tp"]`.
+    save_path : str or pathlib.Path, optional
+        Output CSV path; defaults to `era5_<lat>_<lon>_<start>_<end>.csv`. The `.csv` suffix is forced.
+    api_url : str, optional
+        CDS API endpoint override.
+    api_key : str, optional
+        CDS API key override.
+    quiet : bool, default True
+        Suppress `cdsapi` client progress output.
+    map_variables : bool, default True
+        Rename columns to standard names (`ghi`, `longwave_down`, `temp_air`, `pressure`, `cloud_fraction`, `precipitation`, ...).
+    convert_units : bool, default True
+        Apply unit conversions (e.g. K -> degC, m -> mm).
+
+    Returns
+    -------
+    PointResult dataclass — `data` (pandas.DataFrame with a `UTC_time` column plus the requested variables), `metadata` (dict: request, columns, coverage), `csv_path`, `metadata_path` (pathlib.Path). The CSV and a `<stem>_metadata.json` sidecar are written to disk.
+
+    Notes
+    -----
+    Issues one CDS retrieve covering the whole range, then parses and rewrites the CSV. Uses the CDS `cdsapi` client: passing only `api_key` targets the public endpoint (CDS for ERA5, ADS for CAMS); otherwise settings come from `~/.cdsapirc`, with `api_url`/`api_key` overriding individual values.
+    """
     start_ts = _to_utc_naive_timestamp(start)
     end_ts = _to_utc_naive_timestamp(end)
 
@@ -387,6 +450,44 @@ def download_era5_point(lat: float, lon: float, start: Any, end: Any, variables:
 
 
 def download_era5_area(lat_1: float, lon_1: float, lat_2: float, lon_2: float, start: Any, end: Any, variables: Optional[Sequence[str]] = None, output_dir: str | Path = "ERA5_data", file_prefix: Optional[str] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = True) -> AreaResult:
+    """
+    Download ERA5 reanalysis for a bounding box from the CDS API as monthly GRIB files.
+
+    Parameters
+    ----------
+    lat_1 : float
+        First corner latitude [degrees].
+    lon_1 : float
+        First corner longitude [degrees].
+    lat_2 : float
+        Opposite corner latitude [degrees]; must differ from `lat_1` (`ValueError`), order versus `lat_1` is irrelevant (sorted internally).
+    lon_2 : float
+        Opposite corner longitude [degrees]; must differ from `lon_1` (`ValueError`).
+    start : Any
+        Start of the period; anything `pandas.Timestamp` accepts, converted to UTC (tz-aware values are converted, naive values are taken as-is).
+    end : Any
+        End of the period (same parsing as `start`); must not precede `start` (`ValueError`).
+    variables : sequence of str, optional
+        CDS variable names or local aliases; defaults to `["ssrd", "strd", "t2m", "sp", "tcc"]`.
+    output_dir : str or pathlib.Path, default "ERA5_data"
+        Directory for GRIB parts and metadata (created if missing).
+    file_prefix : str, optional
+        Output file prefix; defaults to `era5_area_<lat_1>_<lon_1>_<lat_2>_<lon_2>`.
+    api_url : str, optional
+        CDS API endpoint override.
+    api_key : str, optional
+        CDS API key override.
+    quiet : bool, default True
+        Suppress `cdsapi` client progress output.
+
+    Returns
+    -------
+    AreaResult dataclass — `grib_paths` (list of pathlib.Path, one GRIB part per month), `metadata` (dict), `metadata_path`. A `<prefix>_metadata.json` sidecar is written.
+
+    Notes
+    -----
+    The range is split into month chunks, each retrieved as its own GRIB file. Uses the CDS `cdsapi` client: passing only `api_key` targets the public endpoint (CDS for ERA5, ADS for CAMS); otherwise settings come from `~/.cdsapirc`, with `api_url`/`api_key` overriding individual values.
+    """
     start_ts = _to_utc_naive_timestamp(start)
     end_ts = _to_utc_naive_timestamp(end)
 
@@ -447,6 +548,36 @@ def download_era5_area(lat_1: float, lon_1: float, lat_2: float, lon_2: float, s
 # -----------------------------------------------------------------------------
 
 def download_era5(mode: str = "point", start: Any = None, end: Any = None, variables: Optional[Sequence[str]] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = True, **kwargs: Any) -> PointResult | AreaResult:
+    """
+    Unified ERA5 entry point; dispatches to the point or area downloader by `mode`.
+
+    Parameters
+    ----------
+    mode : str, default "point"
+        `"point"` or `"area"` (case-insensitive; `ValueError` otherwise).
+    start : Any
+        Start of the period; required (`ValueError` when `None`).
+    end : Any
+        End of the period; required.
+    variables : sequence of str, optional
+        Forwarded to the chosen downloader.
+    api_url : str, optional
+        CDS API endpoint override.
+    api_key : str, optional
+        CDS API key override.
+    quiet : bool, default True
+        Suppress `cdsapi` client progress output.
+    **kwargs : keyword arguments
+        `mode="point"` requires `lat`, `lon` (optional `save_path`, `map_variables`, `convert_units`); `mode="area"` requires `lat_1`, `lon_1`, `lat_2`, `lon_2` (optional `output_dir`, `file_prefix`). Missing required keys raise `ValueError`.
+
+    Returns
+    -------
+    PointResult or AreaResult — whichever dataclass the selected downloader returns.
+
+    Notes
+    -----
+    Uses the CDS `cdsapi` client: passing only `api_key` targets the public endpoint (CDS for ERA5, ADS for CAMS); otherwise settings come from `~/.cdsapirc`, with `api_url`/`api_key` overriding individual values.
+    """
     mode = mode.lower().strip()
 
     if start is None or end is None:

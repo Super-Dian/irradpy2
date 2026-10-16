@@ -167,7 +167,7 @@ Issues one CDS retrieve covering the whole range, then parses and rewrites the C
 
 ### `download_merra2(collection_names=None, initial_year=None, final_year=None, initial_month=1, final_month=12, initial_day=1, final_day=None, lat_1=-90, lon_1=-180, lat_2=90, lon_2=180, lat=None, lon=None, mode='area', start=None, end=None, variables=None, output_dir='MERRA2_data', save_path=None, auth=None, username=None, password=None, merge_timelapse='none', thread_num=1, map_variables=True, timeout=(30, 300))`
 
-Unified MERRA2 downloader.  mode="area"     Download NetCDF subset files by four area parameters: lat_1, lon_1, lat_2, lon_2.  mode="point"     Download single-point CSV time series by lat and lon.
+Unified MERRA2 downloader for gridded NetCDF subsets and single-point CSV time series.  mode="area" downloads NetCDF subset files by four area parameters (lat_1, lon_1, lat_2, lon_2); mode="point" downloads a single-point CSV time series by lat and lon.
 
 **Parameters**
 
@@ -212,5 +212,5 @@ Return a copy of the built-in MERRA2 collection registry.
 
 **Returns**
 
-dict — a copy of the built-in registry `{collection_name: {...}}`; mutating it does not affect the module-level table.
+dict     A copy of ``{collection_name: {...}}``; mutating it does not affect     the module-level table.
 
