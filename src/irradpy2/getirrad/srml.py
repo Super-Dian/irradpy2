@@ -269,6 +269,17 @@ def download_srml(site: str, start: str, end: str, save_path: str):
     save_path : str
         Absolute output CSV file path.
 
+    Returns
+    -------
+    None
+        The merged table is written to ``save_path``.
+
+    Raises
+    ------
+    ValueError
+        When ``save_path`` is empty or not an absolute path, or when
+        ``site`` is unknown.
+
     References
     ----------
     SRML homepage:

@@ -189,6 +189,11 @@ def download_midc(site: str, start: str, end: str, save_path: str):
         End date in YYYYMMDD format.
     save_path : str
         Output CSV file path.
+
+    Returns
+    -------
+    None
+        The merged table is written to ``save_path``.
     """
     max_workers = 2
     site = site.upper().strip()
