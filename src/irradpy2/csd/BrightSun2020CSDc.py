@@ -7,6 +7,23 @@ from scipy.optimize import fmin
 
 
 def datetime_convert(datetime: np.ndarray):
+    """Convert a datetime sequence to (datetime, day-of-year, year) arrays.
+
+    Parameters
+    ----------
+    datetime : np.ndarray
+        Datetime sequence parsed with ``pandas.to_datetime``; invalid
+        entries become NaT.
+
+    Returns
+    -------
+    datetime_dt : numpy.ndarray of object
+        Parsed datetime values as a flat 1-D object array.
+    Dayth : numpy.ndarray of float
+        Day of year (1-366), flat 1-D.
+    Year : numpy.ndarray of float
+        Calendar year, flat 1-D.
+    """
     datetime_array = np.asarray(datetime)
     datetime_flat = datetime_array.reshape(-1)
     time = pd.to_datetime(datetime_flat, errors="coerce")
@@ -288,6 +305,38 @@ def BrightSun2020CSDc(zen: np.ndarray, ghi: np.ndarray, ghics: np.ndarray, dhi: 
 
     This function is a structural Python refactor of the original MATLAB implementation.
     Parameters, thresholds, criteria order, optimisation flow, and duration-filter logic are preserved.
+
+    Parameters
+    ----------
+    zen : array-like
+        Solar zenith angle [degrees], column vector.
+    ghi : array-like
+        Global horizontal irradiance [W m-2], column vector.
+    ghics : array-like
+        Clear-sky global horizontal irradiance [W m-2], column vector.
+    dhi : array-like
+        Diffuse horizontal irradiance [W m-2], column vector.
+    difcs : array-like
+        Clear-sky diffuse horizontal irradiance [W m-2], column vector.
+    datetime : array-like
+        Datetime input.
+    plot_figure : any, optional
+        If provided, diagnostic figures are plotted.
+
+    Returns
+    -------
+    csd : np.ndarray
+        Clear-sky detection for cloudless sky.
+        1 means that clouds were detected.
+        0 means clear sky.
+    csd_tricomponent : np.ndarray
+        Clear-sky detection from the Reno tri-component optimisation.
+    ghics_optimised : np.ndarray
+        Optimised clear-sky GHI curve.
+    dnics_optimised : np.ndarray
+        Optimised clear-sky DNI curve.
+    difcs_optimised : np.ndarray
+        Optimised clear-sky diffuse (DIF) curve.
     """
 
     warnings.filterwarnings("ignore", message=".*All-NaN slice encountered.*")

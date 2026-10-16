@@ -6,6 +6,21 @@ from scipy.linalg import hankel
 
 
 def datetime_convert(datetime: np.ndarray):
+    """Convert a datetime sequence to (day-of-year, year) arrays.
+
+    Parameters
+    ----------
+    datetime : np.ndarray
+        Datetime sequence parsed with ``pandas.to_datetime``; invalid
+        entries become NaT. The original array shape is preserved.
+
+    Returns
+    -------
+    Dayth : numpy.ndarray of float
+        Day of year (1-366), same shape as ``datetime``.
+    Year : numpy.ndarray of float
+        Calendar year, same shape as ``datetime``.
+    """
     datetime_array = np.asarray(datetime)
     original_shape = datetime_array.shape
     datetime_flat = datetime_array.reshape(-1)
@@ -76,6 +91,32 @@ def Garcia2014CSD(ghi: np.ndarray, dhi: np.ndarray, zen: np.ndarray, aod550: np.
 
     This function is a direct structural Python translation of the MATLAB implementation.
     The original thresholds, solar-noon procedure, variability test, and plotting logic are preserved.
+
+    Parameters
+    ----------
+    ghi : array-like
+        Global horizontal irradiance [W m-2], column vector.
+    dhi : array-like
+        Diffuse horizontal irradiance [W m-2], column vector.
+    zen : array-like
+        Solar zenith angle [degrees], column vector.
+    aod550 : array-like
+        Total aerosol extinction at 550 nm, column vector.
+    datetime : array-like
+        Datetime input; used to locate solar noon and build the day index.
+    plot_figure : any, optional
+        If provided, a diagnostic figure is plotted.
+
+    Returns
+    -------
+    csd : np.ndarray
+        Clear-sky detection flag.
+        1 means that clouds were detected.
+        0 means clear sky.
+
+    Notes
+    -----
+    Assumes 1-minute data resolution and perfectly time-matched input vectors.
     """
 
     warnings.filterwarnings("ignore", message=".*All-NaN slice encountered.*")

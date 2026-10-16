@@ -60,6 +60,23 @@ def Ellis2018CSD(ghi: np.ndarray, ghics: np.ndarray, plot_figure=None):
 
     This function is a direct structural Python translation of the MATLAB implementation.
     The original criteria thresholds, optimisation order, and output logic are preserved.
+
+    Parameters
+    ----------
+    ghi : array-like
+        Global horizontal irradiance [W m-2], column vector.
+    ghics : array-like
+        Clear-sky global horizontal irradiance [W m-2], column vector;
+        equal in length to ``ghi``.
+    plot_figure : any, optional
+        If provided, a diagnostic figure illustrating the outcome is plotted.
+
+    Returns
+    -------
+    csd : np.ndarray
+        Clear-sky detection flag as a column vector.
+        1 means that clouds were detected.
+        0 means clear sky.
     """
 
     warnings.filterwarnings("ignore", message=".*All-NaN slice encountered.*")
