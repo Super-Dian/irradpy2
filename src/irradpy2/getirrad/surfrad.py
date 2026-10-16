@@ -114,8 +114,14 @@ def download_surfrad(site: str, start: str, end: str, save_path: str):
         Start date (YYYY-MM-DD or YYYYMMDD).
     end : str
         End date (YYYY-MM-DD or YYYYMMDD).
-    save_path : str, optional
-        Output CSV path. If None, the filename is auto-generated.
+    save_path : str
+        Output CSV path. Required argument — pass ``None`` to auto-generate
+        the filename ``surfrad_<start>_<end>.csv`` in the working directory.
+
+    Returns
+    -------
+    None
+        The merged table is written to ``save_path``.
     """
     start_date = init_date(start)
     end_date = init_date(end)

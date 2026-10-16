@@ -24,6 +24,10 @@ Download BSRN shortwave radiation data and save the result as a CSV file.
 - `password` (*str*) — BSRN FTP password.
 - `save_path` (*str*) — Absolute output CSV file path.
 
+**Returns**
+
+None     The merged table is written to ``save_path``.
+
 **References**
 
 BSRN homepage:
@@ -42,6 +46,10 @@ Public high-level MIDC download interface.
 - `start` (*str*) — Start date in YYYYMMDD format.
 - `end` (*str*) — End date in YYYYMMDD format.
 - `save_path` (*str*) — Output CSV file path.
+
+**Returns**
+
+None     The merged table is written to ``save_path``.
 
 ### `download_sauran(site, start, end, save_path)`
 
@@ -69,6 +77,10 @@ Download SOLRAD data for a given site and save the processed result as a CSV fil
 - `end` (*str*) — End date in ``YYYY-MM-DD`` or ``YYYYMMDD`` format.
 - `save_path` (*str*) — Absolute output CSV file path.
 
+**Returns**
+
+None     The merged table is written to ``save_path``.
+
 **References**
 
 NOAA SOLRAD homepage:
@@ -88,6 +100,10 @@ Download SRML data for a given site and save the processed result as a CSV file.
 - `end` (*str*) — End date in ``YYYYMMDD`` format.
 - `save_path` (*str*) — Absolute output CSV file path.
 
+**Returns**
+
+None     The merged table is written to ``save_path``.
+
 **References**
 
 SRML homepage:
@@ -105,5 +121,9 @@ Public SURFRAD download function (replaces fetch_surfrad_data).
 - `site` (*str*) — SURFRAD site ID (e.g., "bon", "dra", "fpk").
 - `start` (*str*) — Start date (YYYY-MM-DD or YYYYMMDD).
 - `end` (*str*) — End date (YYYY-MM-DD or YYYYMMDD).
-- `save_path` (*str, optional*) — Output CSV path. If None, the filename is auto-generated.
+- `save_path` (*str*) — Output CSV path. Required argument — pass ``None`` to auto-generate the filename ``surfrad_<start>_<end>.csv`` in the working directory.
+
+**Returns**
+
+None     The merged table is written to ``save_path``.
 

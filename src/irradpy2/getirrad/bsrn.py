@@ -86,7 +86,25 @@ class BSRNDownloader:
             return False
 
     def download_and_extract(self, start, end, out_dir):
-        """Download and extract monthly source files within the specified date range."""
+        """Download and extract monthly source files within the specified date range.
+
+        Parameters
+        ----------
+        start : str
+            Start date in ``YYYYMMDD`` format.
+        end : str
+            End date in ``YYYYMMDD`` format.
+        out_dir : str
+            Directory that receives the extracted ``.dat`` files (created if
+            missing).
+
+        Returns
+        -------
+        stats : dict
+            Keys ``target_files``, ``available_files``, ``missing_files``,
+            ``downloaded_files``, ``extracted_files`` and ``ftp_error``.
+            FTP failures are captured in ``ftp_error`` rather than raised.
+        """
         ensure_dir(out_dir)
 
         targets = [f"{self.site}{m}.dat.gz" for m in self._generate_month_ranges(start, end)]
@@ -207,7 +225,27 @@ class BSRNDownloader:
         return row_count
 
     def generate_csv(self, data_dir, start, end, out_path):
-        """Generate the final CSV file from parsed BSRN data."""
+        """Generate the final CSV file from parsed BSRN data.
+
+        Parameters
+        ----------
+        data_dir : str
+            Directory containing extracted ``.dat`` files.
+        start : str
+            Start date in ``YYYYMMDD`` format (UTC, inclusive).
+        end : str
+            End date in ``YYYYMMDD`` format (UTC, inclusive, extended to
+            23:59).
+        out_path : str
+            Destination CSV path; the header row is always written.
+
+        Returns
+        -------
+        parsed_files : int
+            Number of ``.dat`` files parsed.
+        total_rows : int
+            Number of data rows written.
+        """
         start_dt = datetime.strptime(start, "%Y%m%d").replace(tzinfo=timezone.utc)
         end_dt = datetime.strptime(end, "%Y%m%d").replace(hour=23, minute=59, tzinfo=timezone.utc)
 
@@ -270,7 +308,24 @@ class BSRNDownloader:
             pass
 
     def run(self, start, end, save_path):
-        """Run the complete BSRN download and conversion workflow."""
+        """Run the complete BSRN download and conversion workflow.
+
+        Parameters
+        ----------
+        start : str
+            Start date in ``YYYYMMDD`` format.
+        end : str
+            End date in ``YYYYMMDD`` format.
+        save_path : str
+            Absolute output CSV path; the parent directory is created if
+            missing.
+
+        Returns
+        -------
+        None
+            The CSV is written to ``save_path``; the temporary download
+            directory is removed even on failure.
+        """
         save_path = os.path.abspath(save_path)
         save_dir = os.path.dirname(save_path)
 
@@ -323,6 +378,16 @@ def download_bsrn(site, start, end, username, password, save_path):
         BSRN FTP password.
     save_path : str
         Absolute output CSV file path.
+
+    Returns
+    -------
+    None
+        The merged table is written to ``save_path``.
+
+    Raises
+    ------
+    ValueError
+        When ``save_path`` is empty or not an absolute path.
 
     References
     ----------

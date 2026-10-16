@@ -27,6 +27,31 @@ def http_get_with_retry(url: str,
                         backoff: float = 1.5) -> str:
     """
     Send an HTTP GET request with retry support and return the response text.
+
+    Parameters
+    ----------
+    url : str
+        Request URL.
+    params : dict, optional
+        Query-string parameters.
+    headers : dict, optional
+        Extra headers merged over the built-in defaults.
+    timeout : int, default 30
+        Socket timeout in seconds (the connect timeout is capped at 10 s).
+    max_retries : int, default 3
+        Number of attempts before the last exception is re-raised.
+    backoff : float, default 1.5
+        Base for the exponential sleep between retries.
+
+    Returns
+    -------
+    str
+        Response text with any leading BOM stripped.
+
+    Raises
+    ------
+    requests.RequestException
+        Re-raised from the final attempt when all retries fail.
     """
     hdr = {
         "User-Agent": "Mozilla/5.0",
@@ -62,6 +87,17 @@ def http_get_with_retry(url: str,
 def read_flexible_csv(text: str) -> pd.DataFrame:
     """
     Parse CSV text into a DataFrame with flexible delimiter handling.
+
+    Parameters
+    ----------
+    text : str
+        Raw CSV (or delimited) text.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Parsed table; delimiter is sniffed when the fast comma parse fails,
+        and BOM-like artifacts are stripped from column names.
     """
     raw = StringIO(text)
     try:
@@ -113,6 +149,22 @@ def tz_localize_safely(naive_ts: pd.Series,
                        ambiguous: str = "infer") -> pd.Series:
     """
     Localize naive timestamps to a timezone-aware series.
+
+    Parameters
+    ----------
+    naive_ts : pandas.Series
+        Timezone-naive datetime series.
+    tz : str
+        Target timezone name.
+    nonexistent : str, default "shift_forward"
+        Policy for nonexistent local times.
+    ambiguous : str, default "infer"
+        Policy for ambiguous local times.
+
+    Returns
+    -------
+    pandas.Series
+        Timezone-aware series.
     """
     return naive_ts.dt.tz_localize(tz, nonexistent=nonexistent, ambiguous=ambiguous)
 
@@ -121,6 +173,18 @@ def format_local_str(local_ts: pd.Series,
                      fmt: str = "%Y/%m/%d %H:%M:00") -> pd.Series:
     """
     Format a timestamp series as strings.
+
+    Parameters
+    ----------
+    local_ts : pandas.Series
+        Datetime series.
+    fmt : str, default "%Y/%m/%d %H:%M:00"
+        strftime format string.
+
+    Returns
+    -------
+    pandas.Series
+        Formatted strings.
     """
     return local_ts.dt.strftime(fmt)
 
@@ -131,6 +195,22 @@ def attach_local_and_offset(df: pd.DataFrame,
                             offset_col: str = "UTC_Offset") -> pd.DataFrame:
     """
     Add local time and UTC offset columns to a DataFrame.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input table; copied before columns are added.
+    local_ts : pandas.Series
+        Timezone-aware local timestamps aligned with ``df``.
+    local_col : str, default "Local_Time"
+        Name of the formatted local-time column.
+    offset_col : str, default "UTC_Offset"
+        Name of the UTC-offset column (format "+HH:MM").
+
+    Returns
+    -------
+    pandas.DataFrame
+        Copy of ``df`` with the two new columns placed first.
     """
     local_str = local_ts.dt.strftime("%Y/%m/%d %H:%M:00")
     z = local_ts.dt.strftime("%z").str.replace(r"([+-]\d{2})(\d{2})", r"\1:\2", regex=True)
@@ -147,6 +227,25 @@ def clip_by_local_date(local_ts: pd.Series,
                        tz: str) -> Tuple[pd.Series, pd.Series]:
     """
     Filter timestamps by a local date range.
+
+    Parameters
+    ----------
+    local_ts : pandas.Series
+        Timezone-aware local timestamps.
+    begin : str
+        Inclusive start date in ``YYYYMMDD`` format.
+    end : str
+        Inclusive end date in ``YYYYMMDD`` format (the window extends to the
+        end of that day).
+    tz : str
+        Timezone used to localize the ``begin``/``end`` bounds.
+
+    Returns
+    -------
+    mask : pandas.Series of bool
+        Boolean mask over ``local_ts``.
+    filtered : pandas.Series
+        The timestamps inside the window.
     """
     beg = pd.to_datetime(begin, format="%Y%m%d").tz_localize(tz)
     endt = (pd.to_datetime(end, format="%Y%m%d") + pd.Timedelta(days=1)).tz_localize(tz)
@@ -160,6 +259,18 @@ def expand_unnamed_columns(actual_cols: Sequence[str],
                            prefix: str = "Unnamed:") -> list:
     """
     Return all column names that start with the given prefix.
+
+    Parameters
+    ----------
+    actual_cols : sequence of str
+        Column names to filter.
+    prefix : str, default "Unnamed:"
+        Prefix to match.
+
+    Returns
+    -------
+    list of str
+        Matching column names, in input order.
     """
     return [c for c in actual_cols if c.startswith(prefix)]
 
@@ -167,6 +278,22 @@ def expand_unnamed_columns(actual_cols: Sequence[str],
 def init_date(date_str):
     """
     Parse a date string into a date object.
+
+    Parameters
+    ----------
+    date_str : str
+        Date in ``YYYYMMDD``, ``YYYY.MM.DD``, ``YYYY-MM-DD`` or
+        ``YYYY/MM/DD`` format.
+
+    Returns
+    -------
+    datetime.date
+        Parsed date.
+
+    Raises
+    ------
+    ValueError
+        When the string matches none of the supported formats.
     """
     formats = ["%Y%m%d", "%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d"]
     for fmt in formats:
@@ -180,6 +307,22 @@ def init_date(date_str):
 def init_str_date(date_str):
     """
     Parse a date string and return it in YYYY-MM-DD format.
+
+    Parameters
+    ----------
+    date_str : str
+        Date in ``YYYYMMDD``, ``YYYY.MM.DD``, ``YYYY-MM-DD`` or
+        ``YYYY/MM/DD`` format.
+
+    Returns
+    -------
+    str
+        Date normalized to ``YYYY-MM-DD``.
+
+    Raises
+    ------
+    ValueError
+        When the string matches none of the supported formats.
     """
     formats = ["%Y%m%d", "%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d"]
     for fmt in formats:
@@ -194,6 +337,11 @@ def init_str_date(date_str):
 def get_yesterday_utc_minus_7():
     """
     Return yesterday's date in the America/Denver timezone.
+
+    Returns
+    -------
+    datetime.date
+        Calendar date one day before "today" in America/Denver (UTC-6/-7).
     """
     utc_minus_7 = pytz.timezone('America/Denver')
     now_utc_minus_7 = datetime.now(utc_minus_7)
@@ -204,6 +352,18 @@ def get_yesterday_utc_minus_7():
 def url_contact(url, content):
     """
     Join a base URL and path segment safely.
+
+    Parameters
+    ----------
+    url : str
+        Base URL; trailing slashes are stripped.
+    content : str
+        Path segment; surrounding slashes are stripped.
+
+    Returns
+    -------
+    str
+        ``url + '/' + content`` with exactly one separator.
     """
     url = url.rstrip("/")
     content = str(content).strip("/")
@@ -213,6 +373,16 @@ def url_contact(url, content):
 def ensure_dir(path: str):
     """
     Create the directory if it does not already exist.
+
+    Parameters
+    ----------
+    path : str
+        Directory path; ignored when empty. Parent directories are created
+        as needed.
+
+    Returns
+    -------
+    None
     """
     if path and not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
@@ -221,6 +391,16 @@ def ensure_dir(path: str):
 def fmt_offset(hours: float) -> str:
     """
     Format a timezone offset as +HH:MM or -HH:MM.
+
+    Parameters
+    ----------
+    hours : float
+        Offset in decimal hours (e.g. ``-7.0`` or ``5.5``).
+
+    Returns
+    -------
+    str
+        Offset string such as ``"+05:30"`` or ``"-07:00"``.
     """
     sign = "+" if hours >= 0 else "-"
     h = abs(int(hours))

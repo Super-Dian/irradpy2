@@ -148,6 +148,16 @@ def download_solrad(site: str, start: str, end: str, save_path: str) -> None:
     save_path : str
         Absolute output CSV file path.
 
+    Returns
+    -------
+    None
+        The merged table is written to ``save_path``.
+
+    Raises
+    ------
+    ValueError
+        When ``save_path`` is empty or not an absolute path.
+
     References
     ----------
     NOAA SOLRAD homepage:
