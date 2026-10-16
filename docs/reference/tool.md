@@ -18,9 +18,9 @@ Calculate day of year and year.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Input table.
-- `time_col` (*str*) — Datetime column.
-- `doy_col` (*str*) — Output column name for day-of-year.
-- `year_col` (*str*) — Output column name for the year.
+- `time_col` (*str, default 'UTC'*) — Datetime column.
+- `doy_col` (*str, default 'doy'*) — Output column name for day-of-year.
+- `year_col` (*str, default 'year'*) — Output column name for the year.
 
 **Returns**
 
@@ -33,9 +33,9 @@ Calculate horizontal extraterrestrial irradiance [W/m²].
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Input table containing a zenith-angle column.
-- `time_col` (*str*) — Datetime column (day-of-year is derived from it).
-- `zen_col` (*str*) — Zenith angle column [degrees].
-- `exth_col` (*str*) — Output column name for horizontal extraterrestrial irradiance.
+- `time_col` (*str, default 'UTC'*) — Datetime column (day-of-year is derived from it).
+- `zen_col` (*str, default 'zen'*) — Zenith angle column [degrees].
+- `exth_col` (*str, default 'exth'*) — Output column name for horizontal extraterrestrial irradiance.
 
 **Returns**
 
@@ -52,8 +52,8 @@ Calculate mean absolute error.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Table holding observed and predicted columns.
-- `obs_col` (*str*) — Observed-values column.
-- `pred_col` (*str*) — Predicted-values column.
+- `obs_col` (*str, default 'ghi'*) — Observed-values column.
+- `pred_col` (*str, default 'ghi_pred'*) — Predicted-values column.
 
 **Returns**
 
@@ -66,8 +66,8 @@ Calculate mean bias error.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Table holding observed and predicted columns.
-- `obs_col` (*str*) — Observed-values column.
-- `pred_col` (*str*) — Predicted-values column.
+- `obs_col` (*str, default 'ghi'*) — Observed-values column.
+- `pred_col` (*str, default 'ghi_pred'*) — Predicted-values column.
 
 **Returns**
 
@@ -84,8 +84,8 @@ Calculate common evaluation metrics.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Table holding observed and predicted columns.
-- `obs_col` (*str*) — Observed-values column.
-- `pred_col` (*str*) — Predicted-values column.
+- `obs_col` (*str, default 'ghi'*) — Observed-values column.
+- `pred_col` (*str, default 'ghi_pred'*) — Predicted-values column.
 
 **Returns**
 
@@ -98,8 +98,8 @@ Calculate mean squared error.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Table holding observed and predicted columns.
-- `obs_col` (*str*) — Observed-values column.
-- `pred_col` (*str*) — Predicted-values column.
+- `obs_col` (*str, default 'ghi'*) — Observed-values column.
+- `pred_col` (*str, default 'ghi_pred'*) — Predicted-values column.
 
 **Returns**
 
@@ -116,8 +116,8 @@ Calculate coefficient of determination.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Table holding observed and predicted columns.
-- `obs_col` (*str*) — Observed-values column.
-- `pred_col` (*str*) — Predicted-values column.
+- `obs_col` (*str, default 'ghi'*) — Observed-values column.
+- `pred_col` (*str, default 'ghi_pred'*) — Predicted-values column.
 
 **Returns**
 
@@ -134,8 +134,8 @@ Calculate root mean squared error.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Table holding observed and predicted columns.
-- `obs_col` (*str*) — Observed-values column.
-- `pred_col` (*str*) — Predicted-values column.
+- `obs_col` (*str, default 'ghi'*) — Observed-values column.
+- `pred_col` (*str, default 'ghi_pred'*) — Predicted-values column.
 
 **Returns**
 
@@ -151,7 +151,7 @@ Calculate solar zenith angle in degrees.
 - `latitude` (*float*) — Site latitude [degrees].
 - `longitude` (*float*) — Site longitude [degrees].
 - `time_col` (*str, optional*) — Datetime column. When `None`, auto-detects among `Timestamp`, `UTC`, `UTC_time`, `time`.
-- `zen_col` (*str*) — Output column name for the zenith angle.
+- `zen_col` (*str, default 'zen'*) — Output column name for the zenith angle.
 
 **Returns**
 
@@ -170,15 +170,15 @@ Filter data for DHI and DNI separation evaluation.
 - `data` (*pandas.DataFrame*) — Table with observed components and optional predicted columns.
 - `latitude` (*float*) — Site latitude [degrees]; used to compute `zen` when absent.
 - `longitude` (*float*) — Site longitude [degrees].
-- `time_col` (*str*) — Datetime column (default `"Timestamp"`).
-- `zen_col` (*str*) — Zenith angle column [degrees]; computed when missing.
-- `ghi_col` (*str*) — Observed GHI column.
-- `dni_col` (*str*) — Observed DNI column.
-- `dhi_col` (*str*) — Observed DHI column.
+- `time_col` (*str, default 'Timestamp'*) — Datetime column (default `"Timestamp"`).
+- `zen_col` (*str, default 'zen'*) — Zenith angle column [degrees]; computed when missing.
+- `ghi_col` (*str, default 'Global'*) — Observed GHI column.
+- `dni_col` (*str, default 'Direct'*) — Observed DNI column.
+- `dhi_col` (*str, default 'Diffuse'*) — Observed DHI column.
 - `pred_cols` (*sequence of str, optional*) — Predicted columns that must be finite for a row to be kept.
-- `max_zen` (*float*) — Rows kept only where `zen < max_zen` (default 85).
-- `min_ghi` (*float*) — Rows kept only where `ghi > min_ghi` (default 50).
-- `require_positive` (*bool*) — When `True` (default), also require `dni > 0` and `dhi > 0`.
+- `max_zen` (*float, default 85*) — Rows kept only where `zen < max_zen` (default 85).
+- `min_ghi` (*float, default 50*) — Rows kept only where `ghi > min_ghi` (default 50).
+- `require_positive` (*bool, default True*) — When `True` (default), also require `dni > 0` and `dhi > 0`.
 
 **Returns**
 
@@ -194,7 +194,7 @@ Merge arrays into data columns.
 - `values` (*sequence of array-like*) — Arrays merged in order; matched positionally with `columns`.
 - `columns` (*sequence of str*) — Destination column names.
 - `mask` (*numpy.ndarray of bool, optional*) — Rows that receive `values`; rows outside the mask get `fill_value`. Defaults to all rows.
-- `fill_value` (*float*) — Value written to rows outside `mask` (default `NaN`).
+- `fill_value` (*float, default np.nan*) — Value written to rows outside `mask` (default `NaN`).
 
 **Returns**
 
@@ -207,8 +207,8 @@ Merge multiple time-series DataFrames by datetime index.
 **Parameters**
 
 - `data_list` (*sequence of pandas.DataFrame*) — Frames sharing a datetime index; concatenated column-wise.
-- `time_col` (*str*) — Name given to the restored time column.
-- `dropna` (*bool*) — When `True` (default), rows with any NaN after concatenation are dropped.
+- `time_col` (*str, default 'UTC'*) — Name given to the restored time column.
+- `dropna` (*bool, default True*) — When `True` (default), rows with any NaN after concatenation are dropped.
 
 **Returns**
 
@@ -223,7 +223,7 @@ Plot multiple clear-sky models.
 - `data` (*pandas.DataFrame*) — Table holding clear-sky model outputs.
 - `model_cols` (*dict*) — Maps a model name to `[ghi_col, dni_col, dhi_col]`.
 - `x_col` (*str, optional*) — Datetime x column; falls back to the sample index when absent.
-- `components` (*tuple of str*) — Which components to draw, any of `"ghi"`, `"dni"`, `"dhi"`.
+- `components` (*tuple of str, default ('ghi', 'dni', 'dhi')*) — Which components to draw, any of `"ghi"`, `"dni"`, `"dhi"`.
 
 **Returns**
 
@@ -243,9 +243,9 @@ Plot selected columns in one figure.
 - `y_cols` (*sequence of str*) — Columns drawn as y series.
 - `labels` (*sequence of str, optional*) — Legend labels; defaults to `y_cols`.
 - `x_col` (*str, optional*) — Datetime x column; falls back to the sample index when absent.
-- `title` (*str*) — Figure title.
-- `ylabel` (*str*) — Y-axis label.
-- `marker` (*bool*) — Draw point markers on each series (default `True`).
+- `title` (*str, default 'Data comparison'*) — Figure title.
+- `ylabel` (*str, default 'Value'*) — Y-axis label.
+- `marker` (*bool, default True*) — Draw point markers on each series (default `True`).
 
 **Returns**
 
@@ -262,10 +262,10 @@ Plot clear-sky detection results.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Table with observed, clear-sky and detection columns.
-- `ghi_col` (*str*) — Observed GHI column.
-- `clear_col` (*str*) — Clear-sky GHI column.
-- `csd_col` (*str*) — Detection flag column (`0` = clear sky).
-- `max_points` (*int*) — Downsampling cap for long series (default 3000).
+- `ghi_col` (*str, default 'ghi'*) — Observed GHI column.
+- `clear_col` (*str, default 'ghi_clear'*) — Clear-sky GHI column.
+- `csd_col` (*str, default 'csd'*) — Detection flag column (`0` = clear sky).
+- `max_points` (*int, default 3000*) — Downsampling cap for long series (default 3000).
 
 **Returns**
 
@@ -284,11 +284,11 @@ Plot two series for comparison.
 - `data` (*pandas.DataFrame*) — Table with the two series to compare.
 - `obs_col` (*str*) — Observed series column.
 - `pred_col` (*str*) — Predicted series column.
-- `obs_label` (*str*) — Legend label for the observed series.
-- `pred_label` (*str*) — Legend label for the predicted series.
-- `title` (*str*) — Figure title.
-- `ylabel` (*str*) — Y-axis label.
-- `threshold` (*float*) — Only rows where either series exceeds `threshold` are plotted (default 0).
+- `obs_label` (*str, default 'Observed'*) — Legend label for the observed series.
+- `pred_label` (*str, default 'Predicted'*) — Legend label for the predicted series.
+- `title` (*str, default 'Series Comparison'*) — Figure title.
+- `ylabel` (*str, default 'Value'*) — Y-axis label.
+- `threshold` (*float, default 0*) — Only rows where either series exceeds `threshold` are plotted (default 0).
 - `max_value` (*float, optional*) — When given, values above it are hidden (set to NaN).
 
 **Returns**
@@ -311,8 +311,8 @@ Prepare clear-sky model inputs from ground and MERRA-2 data.
 - `longitude` (*float*) — Site longitude [degrees].
 - `begin` (*str*) — Start date, `YYYY-MM-DD`.
 - `end` (*str*) — End date, `YYYY-MM-DD`.
-- `freq` (*str*) — Target index frequency (default `"1min"`).
-- `source_prefix` (*str*) — Suffix for the renamed `ghi`/`ghi_clear` columns (default `"merra2"`).
+- `freq` (*str, default '1min'*) — Target index frequency (default `"1min"`).
+- `source_prefix` (*str, default 'merra2'*) — Suffix for the renamed `ghi`/`ghi_clear` columns (default `"merra2"`).
 
 **Returns**
 
@@ -345,10 +345,10 @@ Resample selected time-series columns to a fixed frequency.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Input table.
-- `time_col` (*str*) — Datetime column.
+- `time_col` (*str, default 'UTC'*) — Datetime column.
 - `cols` (*sequence of str, optional*) — Columns to keep; defaults to every non-time column.
-- `freq` (*str*) — Pandas offset alias for the target frequency (default `"1h"`).
-- `agg` (*str*) — Aggregation: `"mean"` (default), `"sum"`, or `"median"`.
+- `freq` (*str, default '1h'*) — Pandas offset alias for the target frequency (default `"1h"`).
+- `agg` (*str, default 'mean'*) — Aggregation: `"mean"` (default), `"sum"`, or `"median"`.
 - `lower_limit` (*float, optional*) — Clipping bound passed through to `select_series`.
 - `label_offset` (*str, optional*) — Pandas `Timedelta` added to the bin labels after resampling.
 
@@ -363,7 +363,7 @@ Select numeric time-series columns and set datetime index.
 **Parameters**
 
 - `data` (*pandas.DataFrame*) — Input table.
-- `time_col` (*str*) — Datetime column; parsed to timezone-naive UTC and used as index.
+- `time_col` (*str, default 'UTC'*) — Datetime column; parsed to timezone-naive UTC and used as index.
 - `cols` (*sequence of str, optional*) — Columns to keep; defaults to every non-time column.
 - `lower_limit` (*float, optional*) — When given, values below it are raised to it (clipped).
 
