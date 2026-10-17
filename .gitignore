@@ -34,6 +34,7 @@ htmlcov/
 src/*.zip
 
 # Downloaded data and generated outputs
+src/irradpy2/example/data/
 MERRA2_data/
 ERA5_data/
 CAMS_data/
