@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "irradpy2"
+version = "1.0.10"
+description = "Multi-source solar irradiance data acquisition, modeling, separation, and forecasting toolkit."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+
+
+keywords = [
+    "solar irradiance",
+    "meteorological data",
+    "data acquisition",
+    "clear-sky modeling",
+    "clear-sky detection",
+    "irradiance separation",
+    "solar forecasting",
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "requests",
+    "pytz",
+    "scikit-learn",
+    "torch",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

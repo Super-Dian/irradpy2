@@ -1,0 +1,48 @@
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Test files
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE files
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+
+# Stale source archive — source of truth is src/irradpy2/
+src/*.zip
+
+# Downloaded data and generated outputs
+MERRA2_data/
+ERA5_data/
+CAMS_data/
+*.nc
+*.nc4
+*.grib
+*.grib2
+*.h5
+*.hdf
+
+# Log files
+*.log
