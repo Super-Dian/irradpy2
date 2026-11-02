@@ -3,6 +3,7 @@ import pandas as pd
 
 
 def _prepare_column_input(values, n_rows):
+    """Broadcast scalar or single-value inputs to an (N, 1) float array."""
     values = np.asarray(values, dtype=float)
 
     if values.ndim == 0:
@@ -28,6 +29,7 @@ def _prepare_column_input(values, n_rows):
 
 
 def _parse_datetime(datetime):
+    """Parse timestamps as UTC and reject invalid datetime values."""
     datetime = pd.to_datetime(np.asarray(datetime).reshape(-1), errors="coerce", utc=True)
     datetime = pd.DatetimeIndex(datetime)
 
@@ -38,6 +40,7 @@ def _parse_datetime(datetime):
 
 
 def _extract_datetime_data(datetime):
+    """Return UTC hour, minute, second, and day-of-year arrays."""
     datetime = _parse_datetime(datetime)
 
     hour = np.asarray(datetime.hour, dtype=float)
@@ -49,11 +52,13 @@ def _extract_datetime_data(datetime):
 
 
 def _compute_decimal_time(hour, minute, second):
+    """Calculate decimal hours from hour, minute, and second."""
     decimal_time = hour + minute / 60 + second / 3600
     return decimal_time
 
 
 def _compute_day_of_year_and_decimal_time(ghi, day_of_year, decimal_time):
+    """Reshape day-of-year and decimal-hour values to match the GHI rows."""
     day_of_year = np.asarray(day_of_year, dtype=float).reshape(len(ghi), 1)
     decimal_time = np.asarray(decimal_time, dtype=float).reshape(len(ghi), 1)
 
@@ -61,6 +66,7 @@ def _compute_day_of_year_and_decimal_time(ghi, day_of_year, decimal_time):
 
 
 def _compute_solar_terms(day_of_year, decimal_time, lat, lon):
+    """Calculate solar zenith angle in radians from UTC time and coordinates."""
     beta_eot = (360 / 365.242) * (day_of_year - 1)
     eot = 0.258 * np.cos(np.pi / 180 * beta_eot) - 7.416 * np.sin(np.pi / 180 * beta_eot) - 3.648 * np.cos(np.pi / 180 * 2 * beta_eot) - 9.228 * np.sin(np.pi / 180 * 2 * beta_eot)
 
@@ -80,6 +86,7 @@ def _compute_solar_terms(day_of_year, decimal_time, lat, lon):
 
 
 def _compute_extraterrestrial_irradiance(day_of_year, zen):
+    """Return extraterrestrial normal and horizontal irradiance [W/m^2]."""
     solar_constant = 1366.1
     beta = (2 * np.pi * day_of_year) / 365
 
@@ -104,23 +111,42 @@ def erbs(ghi, datetime, lat, lon):
 
     Parameters
     ----------
-    ghi : numpy.ndarray
-        Global horizontal irradiance [W/m^2], with shape (N,) or (N, 1).
-    datetime : numpy.ndarray
-        UTC datetime values with length N.
-    lat : float
-        Site latitude [degrees].
-    lon : float
-        Site longitude [degrees].
+    ghi : float or array-like
+        Global horizontal irradiance [W/m^2]. Arrays must have shape
+        (N,) or (N, 1). A scalar or single-value input is broadcast
+        to the number of timestamps.
+    datetime : array-like
+        Datetime values with length N. Timezone-aware values are converted
+        to UTC; timezone-naive values are interpreted as UTC.
+    lat : float or array-like
+        Site latitude [degrees], positive north and negative south.
+        Scalars and single-value inputs are broadcast to N rows.
+    lon : float or array-like
+        Site longitude [degrees], positive east and negative west.
+        Scalars and single-value inputs are broadcast to N rows.
 
     Returns
     -------
     kd : numpy.ndarray
-        Diffuse fraction with shape (N, 1).
+        Diffuse fraction with shape (N, 1). For positive GHI, kd is
+        the ratio of DHI to GHI.
     dhi : numpy.ndarray
-        Diffuse horizontal irradiance [W/m^2] with shape (N, 1).
+        Diffuse horizontal irradiance [W/m^2], with shape (N, 1).
     dni : numpy.ndarray
-        Direct normal irradiance [W/m^2] with shape (N, 1).
+        Direct normal irradiance [W/m^2], with shape (N, 1).
+
+    Raises
+    ------
+    ValueError
+        If timestamps are invalid or input arrays have incompatible
+        lengths or shapes.
+
+    Notes
+    -----
+    Solar zenith angle is calculated internally from UTC timestamps and
+    site coordinates. Use nonnegative GHI values.
+    DNI is set to zero for solar zenith angles greater than 87 degrees.
+    At these samples, DHI equals GHI when GHI is nonnegative.
     """
     datetime = _parse_datetime(datetime)
     n_rows = len(datetime)

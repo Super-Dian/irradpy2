@@ -6,7 +6,7 @@ The package provides a consistent interface for working with ground-based observ
 
 ## Features
 
-- Download ground-based solar irradiance observations (BSRN, MIDC, SAURAN, SOLRAD, SRML, SURFRAD)
+- Download ground-based solar irradiance observations (BSRN, MIDC, SOLRAD, SRML, SURFRAD)
 - Download gridded and reanalysis meteorological data (MERRA-2, ERA5, CAMS)
 - Prepare multi-source data for irradiance analysis
 - Run 62 clear-sky irradiance models
