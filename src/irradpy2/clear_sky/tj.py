@@ -42,22 +42,25 @@ def tj(sza: np.ndarray, datetime):
     Renewable and efficient electric power systems.
     John Wiley & Sons.
 
-    Inputs
-    ------
-    sza : array-like
-        Solar zenith angle [radians]
+    Parameters
+    ----------
+    sza : numpy.ndarray
+        Solar zenith angle [radians].
     datetime : array-like
-        Datetime input
+        Datetime values corresponding to sza. The day of year is
+        calculated internally.
 
-    Outputs
+    Returns
     -------
-    [EbnTJ, EdhTJ, EghTJ]
-        EbnTJ : Direct normal irradiance [W m-2]
-        EdhTJ : Diffuse horizontal irradiance [W m-2]
-        EghTJ : Global horizontal irradiance [W m-2]
+    [EghTJ, EbnTJ, EdhTJ] : list of numpy.ndarray
+        EghTJ : Clear-sky global horizontal irradiance [W/m^2].
+        EbnTJ : Clear-sky direct normal irradiance [W/m^2].
+        EdhTJ : Clear-sky diffuse horizontal irradiance [W/m^2].
 
     Notes
     -----
+    Use corresponding datetime and solar zenith angle arrays for daytime
+    calculations. Negative irradiance components are clipped to zero.
     This function is translated directly from the original R code.
     """
 

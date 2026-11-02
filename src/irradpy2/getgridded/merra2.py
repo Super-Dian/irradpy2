@@ -507,15 +507,20 @@ class DownloadManager(object):
         self.__username = username
         self.__password = password
 
-    def _mp_download_wrapper(self, url_item):
-        file_path = os.path.join(self.download_path, self.get_filename(url_item))
+    def _mp_download_wrapper(self, url_item, filename=None):
+        file_path = os.path.join(self.download_path, filename or self.get_filename(url_item))
         self.__download_and_save_file(url_item, file_path)
 
-    def start_download(self):
+    def start_download(self, filename=None):
         """
         Download ``download_url`` into ``download_path``.
 
         Creates the target directory and an authenticated session on first use.
+
+        Parameters
+        ----------
+        filename : str, optional
+            Output filename. When ``None``, it is derived from the download URL.
 
         Returns
         -------
@@ -526,7 +531,7 @@ class DownloadManager(object):
         if self._authenticated_session is None:
             self._authenticated_session = self.__create_authenticated_sesseion()
         os.makedirs(self.download_path, exist_ok=True)
-        self._mp_download_wrapper(self.download_url)
+        self._mp_download_wrapper(self.download_url, filename=filename)
 
     @staticmethod
     def get_filename(url):
@@ -605,7 +610,7 @@ class DownloadManager(object):
 class SocketManager:
     """
     High-level MERRA2 area download manager.
-    Original workflow: coordinate translation -> URL construction -> download -> optional merge.
+    Workflow: coordinate translation -> Cloud CMR discovery -> download -> optional merge.
     """
 
     deff4 = netCDF4.default_fillvals["f4"]
@@ -613,6 +618,9 @@ class SocketManager:
     global_retry = True
     lat_coords = np.arange(0, 361, dtype=int)
     lon_coords = np.arange(0, 576, dtype=int)
+
+    def __init__(self):
+        self._cloud_manager = None
 
     def generate_url_params(self, parameter, time_para, lat_para, lon_para):
         """
@@ -707,6 +715,10 @@ class SocketManager:
         -------
         str
             Remote directory URL.
+
+        Notes
+        -----
+        Legacy URL builder; live area downloads use ``_build_cloud_area_url``.
         """
         if merra2_collection["collection"].startswith("const"):
             return ("https://goldsmr4.gesdisc.eosdis.nasa.gov/opendap/MERRA2_MONTHLY/{db_name}/1980/").format(db_name=merra2_collection["esdt_dir"])
@@ -770,6 +782,45 @@ class SocketManager:
             return "MERRA2_{stream}.{abbrv}.{date}.nc4.{ext}?{params}".format(stream=merra_stream, abbrv=merra2_collection["collection"], date=date_string, params=params, ext=file_extension)
         return "MERRA2_{stream}.{abbrv}.{date}.nc4.{ext}".format(stream=merra_stream, abbrv=merra2_collection["collection"], date=date_string, ext=file_extension)
 
+    def _build_cloud_area_url(self, merra2_collection, date, params, auth):
+        """Discover the daily Cloud granule and request a NetCDF4 DAP4 subset."""
+        if self._cloud_manager is None:
+            self._cloud_manager = MERRA2CSVManager(
+                username=auth["uid"], password=auth["password"]
+            )
+
+        dataset = merra2_collection["esdt_dir"]
+        collection = merra2_collection["collection"]
+        if collection.startswith("const"):
+            short_name, version = self._cloud_manager._dataset_identity(dataset)
+            urls = get_cmr_urls(
+                short_name=short_name, version=version,
+                session=self._cloud_manager.session, limit=10,
+            )
+            date_string = "00000000"
+        else:
+            day = pd.Timestamp(date)
+            urls = self._cloud_manager._get_opendap_urls(
+                dataset, day, day + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+            )
+            date_string = date.strftime("%Y%m%d")
+
+        # CMR temporal searches can also return an adjacent daily granule.
+        marker = f".{collection}.{date_string}.nc4"
+        urls = sorted({url for url in urls if marker in url})
+        if len(urls) != 1:
+            raise RuntimeError(
+                f"Expected one Cloud OPeNDAP granule for {dataset} on {date}, "
+                f"found {len(urls)}."
+            )
+
+        # Cloud subsetting requires DAP4; old DAP2 queries do not subset correctly.
+        url = urls[0].split("?", 1)[0] + ".dap.nc4"
+        if params:
+            selections = ["/" + item for item in params.split(",") if item]
+            url += "?dap4.ce=" + ";".join(selections)
+        return url
+
     def download_merra2_nc(self, date, merra2_collection, output_directory, params, auth):
         """
         Download one daily MERRA-2 granule with a single retry attempt.
@@ -793,17 +844,13 @@ class SocketManager:
             True when the download succeeded; False after the failed attempt
             (``global_retry`` is set unless the cause was authentication).
         """
-        url = os.path.join(self.build_remote_url(merra2_collection, date), self.build_remote_filename(merra2_collection, date, params))
-        file_path = os.path.join(output_directory, DownloadManager.get_filename(url))
+        # Preserve the original local filenames used by the merge/resume logic.
+        filename = self.build_remote_filename(merra2_collection, date, None)
+        file_path = os.path.join(output_directory, filename)
 
         if os.path.exists(file_path):
             logging.info("- Detected duplicated file from date " + str(date) + ", deleting existing file before downloading...")
             os.remove(file_path)
-
-        download_manager = DownloadManager()
-        download_manager.set_username_and_password(auth["uid"], auth["password"])
-        download_manager.download_path = output_directory
-        download_manager.download_url = url
 
         start_time = time.time()
         logging.info("* File from date " + str(date) + " begin to download")
@@ -813,9 +860,17 @@ class SocketManager:
 
         while retry and limit < 1:
             limit += 1
-            log = "{url} # {limit} Time Retry #".format(url=url, limit=limit)
+            log = "{dataset}/{date} # {limit} Time Retry #".format(
+                dataset=merra2_collection["esdt_dir"], date=date, limit=limit
+            )
             try:
-                download_manager.start_download()
+                url = self._build_cloud_area_url(merra2_collection, date, params, auth)
+                download_manager = DownloadManager(
+                    username=auth["uid"], password=auth["password"],
+                    link=url, download_path=output_directory,
+                )
+                download_manager._authenticated_session = self._cloud_manager.session
+                download_manager.start_download(filename=filename)
                 retry = False
             except urllib.error.HTTPError as e:
                 if e.code == 404:
@@ -906,7 +961,7 @@ class SocketManager:
             with the year is left to the caller.
         """
         for y in range(first.year, last.year + 1):
-            yield "{:0>4d}"
+            yield "{:0>4d}".format(y)
 
     def subdaily_universal_download(self, merra2_collection: dict, initial_year: int, final_year: int, initial_month: int = 1, final_month: int = 12, initial_day: int = 1, final_day: Optional[int] = None, params: Optional[str] = None, auth: dict = None, output_directory: Union[str, Path] = None, thread_num: int = 5, merge: str = "monthly"):
         """
@@ -953,7 +1008,7 @@ class SocketManager:
         else:
             log_file = output_directory
 
-        log_file = os.path.join(log_file.parent, "index.npy")
+        log_file = os.path.join(log_file, "index.npy")
         if os.path.exists(log_file):
             log = np.load(log_file).tolist()
         else:
@@ -1093,7 +1148,8 @@ class SocketManager:
             var = os.path.split(name)[1].split("_")[3]
             if var not in collections:
                 collections.append(var)
-            remote_ds = xr.open_dataset(name, engine="netcdf4")
+            with xr.open_dataset(name, engine="netcdf4") as source_ds:
+                remote_ds = source_ds.load()
             try:
                 final_ds = xr.merge([final_ds, remote_ds])
             except ValueError:
@@ -1162,7 +1218,9 @@ class SocketManager:
             return delete_set
 
         logging.info("* Processing data in {0}".format(date))
-        final_ds = xr.open_dataset(nc_files[0], engine="netcdf4")
+        with xr.open_dataset(nc_files[0], engine="netcdf4") as source_ds:
+            final_ds = source_ds.load()
+        time_dimension = "UTC_time" if "UTC_time" in final_ds.dims else "time"
         collections = os.path.split(nc_files[0])[1].split("_")[0]
 
         for name in nc_files[1:]:
@@ -1170,9 +1228,9 @@ class SocketManager:
             var = os.path.split(name)[1].split("_")[0]
             if collections is None or len(collections) > len(var):
                 collections = var
-            remote_ds = xr.open_dataset(name, engine="netcdf4")
-            final_ds = xr.concat([final_ds, remote_ds], dim="time")
-            remote_ds.close()
+            with xr.open_dataset(name, engine="netcdf4") as source_ds:
+                remote_ds = source_ds.load()
+            final_ds = xr.concat([final_ds, remote_ds], dim=time_dimension)
 
         filename = os.path.join(path_data, "{0}_merra2_reanalysis_{1}.nc".format(collections, date))
 
@@ -1230,7 +1288,9 @@ class SocketManager:
             return delete_set
 
         logging.info("* Processing data in {0}".format(date))
-        final_ds = xr.open_dataset(nc_files[0], engine="netcdf4")
+        with xr.open_dataset(nc_files[0], engine="netcdf4") as source_ds:
+            final_ds = source_ds.load()
+        time_dimension = "UTC_time" if "UTC_time" in final_ds.dims else "time"
         collections = os.path.split(nc_files[0])[1].split("_")[0]
 
         for name in nc_files[1:]:
@@ -1238,9 +1298,9 @@ class SocketManager:
             var = os.path.split(name)[1].split("_")[0]
             if collections is None or len(collections) > len(var):
                 collections = var
-            remote_ds = xr.open_dataset(name, engine="netcdf4")
-            final_ds = xr.concat([final_ds, remote_ds], dim="time")
-            remote_ds.close()
+            with xr.open_dataset(name, engine="netcdf4") as source_ds:
+                remote_ds = source_ds.load()
+            final_ds = xr.concat([final_ds, remote_ds], dim=time_dimension)
 
         filename = os.path.join(path_data, "{0}_merra2_reanalysis_{1}.nc".format(collections, date))
 
@@ -1330,7 +1390,7 @@ class SocketManager:
         if output_dir is None:
             output_dir = Path.cwd()
         if not os.path.exists(output_dir):
-            os.mkdir(output_dir)
+            os.makedirs(output_dir, exist_ok=True)
 
         temp_dir_name = "{0}-{1}-{2}~{3}-{4}-{5} {6} [{7},{8}]~[{9},{10}]".format(initial_year, initial_month, initial_day, final_year, final_month, final_day, "-".join(collection_names), lat_1, lon_1, lat_2, lon_2)
         temp_dir_download = os.path.join(output_dir, temp_dir_name)
@@ -1564,6 +1624,65 @@ class MERRA2CSVManager:
         return dap4_url + "?dap4.ce=" + ";".join(selections)
 
     @staticmethod
+    def _normalize_dap4_dataset(dataset):
+        """Use coordinate variables to normalize DAP4 root dimension names.
+
+        Depending on the PyDAP/Xarray versions, a variable named ``lat``
+        can have a dimension named ``/lat``. Coordinate variables may also
+        arrive as data variables, or retain a leading slash themselves.
+        Promote the actual time/latitude/longitude arrays to coordinates
+        before swapping dimensions so point extraction keeps real UTC times.
+        Data variables remain lazy; only coordinate indexes are constructed.
+        """
+        variable_renames = {}
+        for name in dataset.variables:
+            if not isinstance(name, str) or not name.startswith("/"):
+                continue
+            normalized_name = name.lstrip("/")
+            # Only normalize root variables, not variables in nested groups.
+            if not normalized_name or "/" in normalized_name:
+                continue
+            if normalized_name in dataset.variables:
+                raise ValueError(
+                    f"Ambiguous DAP4 variable names: {name!r} and {normalized_name!r}."
+                )
+            if normalized_name in variable_renames.values():
+                raise ValueError(f"Duplicate DAP4 root variable: {normalized_name!r}.")
+            variable_renames[name] = normalized_name
+
+        if variable_renames:
+            dataset = dataset.rename_vars(variable_renames)
+
+        coordinates = ("time", "lat", "lon")
+        missing_coordinates = [name for name in coordinates if name not in dataset.variables]
+        if missing_coordinates:
+            raise ValueError(f"MERRA2 coordinate variables are missing: {missing_coordinates}")
+
+        # Existing indexes can still reference /lat, /lon or /time after a
+        # dimension swap. Rebuild these indexes from the coordinate arrays.
+        indexed_coordinates = [name for name in coordinates if name in dataset.xindexes]
+        if indexed_coordinates:
+            dataset = dataset.drop_indexes(indexed_coordinates)
+        dataset = dataset.set_coords(list(coordinates))
+        dimension_swaps = {}
+        for name in coordinates:
+            coordinate = dataset[name]
+            if coordinate.ndim != 1:
+                raise ValueError(f"MERRA2 coordinate {name!r} must be one-dimensional.")
+            dimension = coordinate.dims[0]
+            if dimension != name:
+                if dimension in dimension_swaps:
+                    raise ValueError(f"MERRA2 coordinates share dimension {dimension!r}.")
+                dimension_swaps[dimension] = name
+
+        if dimension_swaps:
+            dataset = dataset.swap_dims(dimension_swaps)
+        for name in coordinates:
+            if name not in dataset.xindexes:
+                dataset = dataset.set_xindex(name)
+        return dataset
+
+    @staticmethod
     def _replace_missing_values(data: pd.DataFrame, variable_attributes: dict):
         for variable, attributes in variable_attributes.items():
             if variable not in data.columns:
@@ -1586,9 +1705,16 @@ class MERRA2CSVManager:
                 session=self.session,
                 timeout=self.timeout,
             ) as remote_dataset:
+                remote_dataset = self._normalize_dap4_dataset(remote_dataset)
                 missing_variables = [variable for variable in variables if variable not in remote_dataset]
                 if missing_variables:
                     raise RuntimeError(f"Variables missing from the MERRA2 granule: {missing_variables}")
+                for variable in variables:
+                    if set(remote_dataset[variable].dims) != {"time", "lat", "lon"}:
+                        raise ValueError(
+                            f"Unexpected dimensions for {variable}: "
+                            f"{remote_dataset[variable].dims}; expected time, lat and lon."
+                        )
 
                 matched_latitude = float(
                     remote_dataset["lat"].isel(lat=latitude_index).values
@@ -1621,7 +1747,9 @@ class MERRA2CSVManager:
 
             return data, units, matched_latitude, matched_longitude
         except Exception as exc:
-            raise RuntimeError(f"Failed to read MERRA2 point data from {url}") from exc
+            raise RuntimeError(
+                f"Failed to read MERRA2 point data from {url}: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def download_collection_single_point(self, collection_name: str, lat: float, lon: float, start_time: pd.Timestamp, end_time: pd.Timestamp, variables=None):
         """
