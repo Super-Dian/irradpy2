@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "irradpy2"
 version = "1.1.0"
 description = "Multi-source solar irradiance data acquisition, modeling, separation, and forecasting toolkit."
-readme = "README.md"
+readme = "readme.md"
 requires-python = ">=3.10"
 license = "MIT"
 
@@ -37,6 +37,10 @@ dependencies = [
     "scikit-learn",
     "torch",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Super-Dian/irradpy2"
+Repository = "https://github.com/Super-Dian/irradpy2"
 
 [tool.setuptools.packages.find]
 where = ["src"]
