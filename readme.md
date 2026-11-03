@@ -1,5 +1,9 @@
 # irradpy2
 
+[![PyPI](https://img.shields.io/pypi/v/irradpy2.svg)](https://pypi.org/project/irradpy2/)
+[![Python versions](https://img.shields.io/pypi/pyversions/irradpy2.svg)](https://pypi.org/project/irradpy2/)
+[![License: MIT](https://img.shields.io/github/license/Super-Dian/irradpy2.svg)](https://github.com/Super-Dian/irradpy2/blob/main/LICENSE)
+
 `irradpy2` is a Python package for solar irradiance data acquisition and
 analysis, covering clear-sky modeling and detection, irradiance separation,
 GHI forecasting, and evaluation.
