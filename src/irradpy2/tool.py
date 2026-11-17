@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-
 def read_csv(file_path):
     """
     Read a CSV file.
@@ -22,7 +21,7 @@ def read_csv(file_path):
     """
     return pd.read_csv(file_path)
 
-
+1+1
 def cal_zen(data, latitude, longitude, time_col=None, zen_col="zen"):
     """
     Calculate solar zenith angle in degrees.
