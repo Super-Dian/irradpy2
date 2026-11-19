@@ -95,7 +95,13 @@ def _parse_surfrad_line(fields: List[str]) -> Optional[Dict]:
         for key, idx in var_map:
             val = float(fields[idx])
             qc = int(fields[idx + 1])
-            record[key] = val if (qc == 0 and val != -9999.9) else -999.9
+            if qc != 0 or val in {-9999.9, -999.9}:
+                val = -999.9
+            elif key == "uvb":
+                val /= 1000.0
+            elif key in {"dw_case_temp", "dw_dome_temp", "uw_case_temp", "uw_dome_temp"}:
+                val -= 273.15
+            record[key] = val
 
         return record
     except Exception:
@@ -117,6 +123,11 @@ def download_surfrad(site: str, start: str, end: str, save_path: str):
     save_path : str
         Output CSV path. Required argument — pass ``None`` to auto-generate
         the filename ``surfrad_<start>_<end>.csv`` in the working directory.
+
+    Notes
+    -----
+    UVB irradiance uses W/m² and infrared instrument temperatures use °C.
+    Station pressure in millibars is numerically equal to hPa.
 
     Returns
     -------

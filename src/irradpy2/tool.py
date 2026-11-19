@@ -4,60 +4,16 @@ import matplotlib.pyplot as plt
 
 
 def read_csv(file_path):
-    """
-    Read a CSV file.
-
-    Parameters
-    ----------
-    file_path : str
-        Path to the CSV file to read.
-
-    Returns
-    -------
-    pandas.DataFrame — the parsed CSV table.
-
-    Notes
-    -----
-    Thin wrapper around `pandas.read_csv`. Downstream helpers such as `prepare_clearsky` auto-detect the time column among `UTC`, `UTC_time`, `time`.
-    """
+    """Read a CSV file."""
     return pd.read_csv(file_path)
 
 
 def cal_zen(data, latitude, longitude, time_col=None, zen_col="zen"):
-    """
-    Calculate solar zenith angle in degrees.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Input table; copied before the new column is added.
-    latitude : float
-        Site latitude [degrees].
-    longitude : float
-        Site longitude [degrees].
-    time_col : str, optional
-        Datetime column. When `None`, auto-detects among `Timestamp`, `UTC`, `UTC_time`, `time`.
-    zen_col : str, default 'zen'
-        Output column name for the zenith angle.
-
-    Returns
-    -------
-    pandas.DataFrame — copy of `data` with `zen_col` added (zenith angle in degrees).
-
-    Notes
-    -----
-    Returns a copy of `data` with `zen_col` filled in **degrees**. The clear-sky models take radians — convert with `np.radians(zen)`. Raises `ValueError` when no time column can be found.
-    """
+    """Calculate solar zenith angle in degrees."""
     data = data.copy()
 
     if time_col is None:
-        for col in ["Timestamp", "UTC", "UTC_time", "time"]:
-            if col in data.columns:
-                time_col = col
-                break
-
-    if time_col is None:
-        raise ValueError("No time column found. Expected one of: Timestamp, UTC, UTC_time, time.")
+        time_col = _get_time_col(data, ("Timestamp", "UTC", "UTC_time", "time", "valid_time"))
 
     time = pd.to_datetime(data[time_col], utc=True)
     doy = time.dt.dayofyear
@@ -78,28 +34,7 @@ def cal_zen(data, latitude, longitude, time_col=None, zen_col="zen"):
     return data
 
 def cal_exth(data, time_col="UTC", zen_col="zen", exth_col="exth"):
-    """
-    Calculate horizontal extraterrestrial irradiance [W/m²].
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Input table containing a zenith-angle column.
-    time_col : str, default 'UTC'
-        Datetime column (day-of-year is derived from it).
-    zen_col : str, default 'zen'
-        Zenith angle column [degrees].
-    exth_col : str, default 'exth'
-        Output column name for horizontal extraterrestrial irradiance.
-
-    Returns
-    -------
-    pandas.DataFrame — copy of `data` with `exth_col` added [W m-2].
-
-    Notes
-    -----
-    Computes the extraterrestrial DNI (1366.1 W m-2 with the annual equation) times `cos(zen)`; set to 0 where `zen > 90°`.
-    """
+    """Calculate horizontal extraterrestrial irradiance [W/m²]."""
     data = data.copy()
     time = pd.to_datetime(data[time_col], errors="coerce", utc=True)
     doy = time.dt.dayofyear.to_numpy(dtype=float)
@@ -138,24 +73,7 @@ def _cal_sza(data, latitude, longitude, time_col="UTC", sza_col="sza"):
 
 
 def cal_doy_year(data, time_col="UTC", doy_col="doy", year_col="year"):
-    """
-    Calculate day of year and year.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Input table.
-    time_col : str, default 'UTC'
-        Datetime column.
-    doy_col : str, default 'doy'
-        Output column name for day-of-year.
-    year_col : str, default 'year'
-        Output column name for the year.
-
-    Returns
-    -------
-    pandas.DataFrame — copy of `data` with `doy_col` and `year_col` added.
-    """
+    """Calculate day of year and year."""
     data = data.copy()
     time = pd.to_datetime(data[time_col], utc=True)
     data[doy_col] = time.dt.dayofyear
@@ -164,26 +82,7 @@ def cal_doy_year(data, time_col="UTC", doy_col="doy", year_col="year"):
 
 
 def cal_mse(data, obs_col="ghi", pred_col="ghi_pred"):
-    """
-    Calculate mean squared error.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table holding observed and predicted columns.
-    obs_col : str, default 'ghi'
-        Observed-values column.
-    pred_col : str, default 'ghi_pred'
-        Predicted-values column.
-
-    Returns
-    -------
-    float — mean squared error.
-
-    Notes
-    -----
-    Rows where either column is NaN are dropped before the mean.
-    """
+    """Calculate mean squared error."""
     valid_data = data[[obs_col, pred_col]].dropna()
     obs = valid_data[obs_col].values
     pred = valid_data[pred_col].values
@@ -191,42 +90,12 @@ def cal_mse(data, obs_col="ghi", pred_col="ghi_pred"):
 
 
 def cal_rmse(data, obs_col="ghi", pred_col="ghi_pred"):
-    """
-    Calculate root mean squared error.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table holding observed and predicted columns.
-    obs_col : str, default 'ghi'
-        Observed-values column.
-    pred_col : str, default 'ghi_pred'
-        Predicted-values column.
-
-    Returns
-    -------
-    float — root mean squared error.
-    """
+    """Calculate root mean squared error."""
     return np.sqrt(cal_mse(data, obs_col=obs_col, pred_col=pred_col))
 
 
 def cal_mae(data, obs_col="ghi", pred_col="ghi_pred"):
-    """
-    Calculate mean absolute error.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table holding observed and predicted columns.
-    obs_col : str, default 'ghi'
-        Observed-values column.
-    pred_col : str, default 'ghi_pred'
-        Predicted-values column.
-
-    Returns
-    -------
-    float — mean absolute error.
-    """
+    """Calculate mean absolute error."""
     valid_data = data[[obs_col, pred_col]].dropna()
     obs = valid_data[obs_col].values
     pred = valid_data[pred_col].values
@@ -234,26 +103,7 @@ def cal_mae(data, obs_col="ghi", pred_col="ghi_pred"):
 
 
 def cal_mbe(data, obs_col="ghi", pred_col="ghi_pred"):
-    """
-    Calculate mean bias error.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table holding observed and predicted columns.
-    obs_col : str, default 'ghi'
-        Observed-values column.
-    pred_col : str, default 'ghi_pred'
-        Predicted-values column.
-
-    Returns
-    -------
-    float — mean bias error (`predicted - observed` convention).
-
-    Notes
-    -----
-    Sign convention: `MBE = mean(predicted - observed)`. Positive MBE means overestimation, negative MBE underestimation. Some literature uses the opposite sign — check before comparing published values.
-    """
+    """Calculate mean bias error."""
     valid_data = data[[obs_col, pred_col]].dropna()
     obs = valid_data[obs_col].values
     pred = valid_data[pred_col].values
@@ -261,26 +111,7 @@ def cal_mbe(data, obs_col="ghi", pred_col="ghi_pred"):
 
 
 def cal_r2(data, obs_col="ghi", pred_col="ghi_pred"):
-    """
-    Calculate coefficient of determination.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table holding observed and predicted columns.
-    obs_col : str, default 'ghi'
-        Observed-values column.
-    pred_col : str, default 'ghi_pred'
-        Predicted-values column.
-
-    Returns
-    -------
-    float — coefficient of determination, or `NaN` when observed variance is zero.
-
-    Notes
-    -----
-    Returns `NaN` when the observed variance is zero.
-    """
+    """Calculate coefficient of determination."""
     valid_data = data[[obs_col, pred_col]].dropna()
     obs = valid_data[obs_col].values
     pred = valid_data[pred_col].values
@@ -292,22 +123,7 @@ def cal_r2(data, obs_col="ghi", pred_col="ghi_pred"):
 
 
 def cal_metrics(data, obs_col="ghi", pred_col="ghi_pred"):
-    """
-    Calculate common evaluation metrics.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table holding observed and predicted columns.
-    obs_col : str, default 'ghi'
-        Observed-values column.
-    pred_col : str, default 'ghi_pred'
-        Predicted-values column.
-
-    Returns
-    -------
-    dict — keys `MSE`, `RMSE`, `MAE`, `MBE`, `R2`.
-    """
+    """Calculate common evaluation metrics."""
     return {
         "MSE": cal_mse(data, obs_col=obs_col, pred_col=pred_col),
         "RMSE": cal_rmse(data, obs_col=obs_col, pred_col=pred_col),
@@ -318,26 +134,7 @@ def cal_metrics(data, obs_col="ghi", pred_col="ghi_pred"):
 
 
 def merge_columns(data, values, columns, mask=None, fill_value=np.nan):
-    """
-    Merge arrays into data columns.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Destination table; copied before columns are added.
-    values : sequence of array-like
-        Arrays merged in order; matched positionally with `columns`.
-    columns : sequence of str
-        Destination column names.
-    mask : numpy.ndarray of bool, optional
-        Rows that receive `values`; rows outside the mask get `fill_value`. Defaults to all rows.
-    fill_value : float, default np.nan
-        Value written to rows outside `mask` (default `NaN`).
-
-    Returns
-    -------
-    pandas.DataFrame — copy of `data` with the merged columns.
-    """
+    """Merge arrays into data columns."""
     data = data.copy()
 
     if mask is None:
@@ -399,18 +196,45 @@ def _interpolate_time(data, time_col, target_index):
     return data.reset_index()
 
 
-def _convert_clearsky(data):
-    """Convert atmospheric variables to clear-sky model inputs."""
+def canonical_unit(unit):
+    """Normalize equivalent unit spellings used by source metadata."""
+    label = str(unit).strip()
+    token = label.lower().replace(" ", "").replace("·", "").replace("^", "").replace("*", "")
+    token = token.replace("−", "-").replace("⁻²", "-2").replace("²", "2")
+    return {
+        "pa": "Pa", "pascal": "Pa", "pascals": "Pa",
+        "hpa": "hPa", "mb": "hPa", "mbar": "hPa", "millibar": "hPa", "millibars": "hPa",
+        "w/m2": "W/m2", "wm-2": "W/m2",
+        "kg/m2": "kg/m2", "kgm-2": "kg/m2",
+        "du": "DU", "dobson": "DU", "dobsons": "DU", "dobsonunit": "DU", "dobsonunits": "DU",
+        "atmcm": "atm-cm", "atm-cm": "atm-cm", "atm.cm": "atm-cm", "cm": "cm",
+    }.get(token, label)
+
+
+def _convert_clearsky(data, units=None):
+    """Convert MERRA-2 atmospheric variables to clear-sky model units."""
     data = data.copy()
+    units = dict(units or {})
+    if "pressure" in data and not units.get("pressure"):
+        pressure = pd.to_numeric(data["pressure"], errors="coerce")
+        valid = pressure[np.isfinite(pressure) & (pressure > 0)]
+        in_pa = valid > 2000
+        if in_pa.any() and not in_pa.all():
+            raise ValueError("Pressure includes both Pa-scale and hPa-scale values. Specify the input units.")
+        units["pressure"] = "hPa" if not valid.empty and not in_pa.any() else "Pa"
 
-    if "pressure" in data.columns:
-        data["press"] = pd.to_numeric(data["pressure"], errors="coerce") / 100
-
-    if "water_vapour" in data.columns:
-        data["wv"] = pd.to_numeric(data["water_vapour"], errors="coerce") / 10
-
-    if "ozone" in data.columns:
-        data["ozone_input"] = pd.to_numeric(data["ozone"], errors="coerce") / 1000
+    conversions = {
+        "pressure": ("press", "Pa", {"Pa": 100, "hPa": 1}),
+        "water_vapour": ("wv", "kg/m2", {"kg/m2": 10, "cm": 1}),
+        "ozone": ("ozone_input", "DU", {"DU": 1000, "atm-cm": 1}),
+    }
+    for column, (target, native, divisors) in conversions.items():
+        if column not in data:
+            continue
+        unit = canonical_unit(units.get(column) or native)
+        if unit not in divisors:
+            raise ValueError(f"Unsupported {column} unit for clear-sky modelling: {unit!r}.")
+        data[target] = pd.to_numeric(data[column], errors="coerce") / divisors[unit]
 
     if "angstrom_exponent" in data.columns:
         data["ang_alpha"] = pd.to_numeric(data["angstrom_exponent"], errors="coerce")
@@ -426,38 +250,19 @@ def _convert_clearsky(data):
     return data
 
 
-def _get_time_col(data):
-    """Find the time column automatically."""
-    for col in ["UTC", "UTC_time", "time"]:
-        if col in data.columns:
-            return col
-
-    raise ValueError("No time column found. Expected one of: UTC, UTC_time, time.")
+def _get_time_col(data, candidates=("UTC", "UTC_time", "time", "valid_time", "Timestamp")):
+    """Find a UTC time column, including legacy SOLRAD capitalization."""
+    columns = {str(column).casefold(): column for column in data.columns}
+    for name in candidates:
+        if name in data.columns:
+            return name
+        if name.casefold() in columns:
+            return columns[name.casefold()]
+    raise ValueError(f"No UTC time column found. Expected one of: {', '.join(candidates)}.")
 
 
 def select_series(data, time_col="UTC", cols=None, lower_limit=None):
-    """
-    Select numeric time-series columns and set datetime index.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Input table.
-    time_col : str, default 'UTC'
-        Datetime column; parsed to timezone-naive UTC and used as index.
-    cols : sequence of str, optional
-        Columns to keep; defaults to every non-time column.
-    lower_limit : float, optional
-        When given, values below it are raised to it (clipped).
-
-    Returns
-    -------
-    pandas.DataFrame — time-indexed, sorted subset of the selected columns.
-
-    Notes
-    -----
-    Selected columns are coerced to numeric; the returned frame is sorted by time.
-    """
+    """Select numeric time-series columns and set datetime index."""
     data = _parse_time(data, time_col=time_col)
 
     if cols is None:
@@ -473,30 +278,7 @@ def select_series(data, time_col="UTC", cols=None, lower_limit=None):
 
 
 def resample_series(data, time_col="UTC", cols=None, freq="1h", agg="mean", lower_limit=None, label_offset=None):
-    """
-    Resample selected time-series columns to a fixed frequency.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Input table.
-    time_col : str, default 'UTC'
-        Datetime column.
-    cols : sequence of str, optional
-        Columns to keep; defaults to every non-time column.
-    freq : str, default '1h'
-        Pandas offset alias for the target frequency (default `"1h"`).
-    agg : str, default 'mean'
-        Aggregation: `"mean"` (default), `"sum"`, or `"median"`.
-    lower_limit : float, optional
-        Clipping bound passed through to `select_series`.
-    label_offset : str, optional
-        Pandas `Timedelta` added to the bin labels after resampling.
-
-    Returns
-    -------
-    pandas.DataFrame — series resampled to `freq`.
-    """
+    """Resample selected time-series columns to a fixed frequency."""
     data = select_series(data, time_col=time_col, cols=cols, lower_limit=lower_limit)
 
     if agg == "sum":
@@ -513,22 +295,7 @@ def resample_series(data, time_col="UTC", cols=None, freq="1h", agg="mean", lowe
 
 
 def merge_series(data_list, time_col="UTC", dropna=True):
-    """
-    Merge multiple time-series DataFrames by datetime index.
-
-    Parameters
-    ----------
-    data_list : sequence of pandas.DataFrame
-        Frames sharing a datetime index; concatenated column-wise.
-    time_col : str, default 'UTC'
-        Name given to the restored time column.
-    dropna : bool, default True
-        When `True` (default), rows with any NaN after concatenation are dropped.
-
-    Returns
-    -------
-    pandas.DataFrame — concatenated frame with a restored `time_col` column.
-    """
+    """Merge multiple time-series DataFrames by datetime index."""
     data = pd.concat(data_list, axis=1)
 
     if dropna:
@@ -540,37 +307,16 @@ def merge_series(data_list, time_col="UTC", dropna=True):
     return data
 
 
-def prepare_clearsky(ground_data, merra2_data, latitude, longitude, begin, end, freq="1min", source_prefix="merra2"):
+def prepare_clearsky(ground_data, merra2_data, latitude, longitude, begin, end, freq="1min", source_prefix="merra2", *, merra2_units=None):
+    """Prepare clear-sky inputs from ground observations and MERRA-2 data.
+
+    Read units from the downloader's DataFrame metadata when available. Pass
+    merra2_units explicitly for CSVs with a units sidecar. Otherwise infer
+    surface pressure in Pa or hPa by magnitude and use native units for
+    water vapour and ozone.
     """
-    Prepare clear-sky model inputs from ground and MERRA-2 data.
-
-    Parameters
-    ----------
-    ground_data : pandas.DataFrame
-        Ground observations with `ghi`/`dni`/`dhi` columns.
-    merra2_data : pandas.DataFrame
-        MERRA-2 (or compatible) rows with meteorological inputs and `ghi_clear`.
-    latitude : float
-        Site latitude [degrees].
-    longitude : float
-        Site longitude [degrees].
-    begin : str
-        Start date, `YYYY-MM-DD`.
-    end : str
-        End date, `YYYY-MM-DD`.
-    freq : str, default '1min'
-        Target index frequency (default `"1min"`).
-    source_prefix : str, default 'merra2'
-        Suffix for the renamed `ghi`/`ghi_clear` columns (default `"merra2"`).
-
-    Returns
-    -------
-    pandas.DataFrame — aligned analysis table (`UTC`, `ghi`, `dni`, `dhi`, `sza`, atmospheric inputs).
-
-    Notes
-    -----
-    Pipeline: detect time columns → build a complete time index at `freq` → align ground and MERRA-2 rows → interpolate meteorology → convert atmospheric quantities (`pressure`→`press` /100, `water_vapour`→`wv` /10, `ozone`→`ozone_input` /1000, `angstrom_exponent`→`ang_alpha`, `aod550`→`ang_beta`/`aod700`) → compute `sza` in **radians**. Typical output columns: `UTC`, `ghi`, `dni`, `dhi`, `sza`, `press`, `albedo`, `wv`, `aod700`, `ang_alpha`, `ang_beta`, `ozone_input`.
-    """
+    if merra2_units is None:
+        merra2_units = merra2_data.attrs.get("units")
     start = pd.to_datetime(begin).strftime("%Y-%m-%d") + " 00:00:00"
     end = pd.to_datetime(end).strftime("%Y-%m-%d") + " 23:59:00"
     utc_time = _build_index(start, end, freq=freq)
@@ -578,9 +324,15 @@ def prepare_clearsky(ground_data, merra2_data, latitude, longitude, begin, end, 
     ground_time_col = _get_time_col(ground_data)
     merra2_time_col = _get_time_col(merra2_data)
 
+    if "dw_psp" in ground_data.columns:
+        aliases = {"dw_psp": "ghi", "direct": "dni", "diffuse": "dhi"}
+        ground_data = ground_data.rename(columns={
+            name: target for name, target in aliases.items() if target not in ground_data.columns
+        })
     ground_data = _clean_negative(ground_data, cols=["ghi", "dni", "dhi"])
     ground_cols = [ground_time_col] + [col for col in ["ghi", "dni", "dhi"] if col in ground_data.columns]
     ground_data = _reindex_time(ground_data[ground_cols], time_col=ground_time_col, target_index=utc_time)
+    ground_data = ground_data.rename(columns={ground_time_col: "UTC"})
 
     merra2_data = merra2_data.rename(columns={
         merra2_time_col: "UTC",
@@ -591,47 +343,14 @@ def prepare_clearsky(ground_data, merra2_data, latitude, longitude, begin, end, 
     merra2_data = _interpolate_time(merra2_data, time_col="UTC", target_index=utc_time)
 
     data = ground_data.merge(merra2_data, on="UTC", how="left")
-    data = _convert_clearsky(data)
+    data = _convert_clearsky(data, units=merra2_units)
     data = _cal_sza(data, latitude=latitude, longitude=longitude, time_col="UTC", sza_col="sza")
 
     return data
 
 
 def filter_sep_data(data, latitude, longitude, time_col="Timestamp", zen_col="zen", ghi_col="Global", dni_col="Direct", dhi_col="Diffuse", pred_cols=None, max_zen=85, min_ghi=50, require_positive=True):
-    """
-    Filter data for DHI and DNI separation evaluation.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table with observed components and optional predicted columns.
-    latitude : float
-        Site latitude [degrees]; used to compute `zen` when absent.
-    longitude : float
-        Site longitude [degrees].
-    time_col : str, default 'Timestamp'
-        Datetime column (default `"Timestamp"`).
-    zen_col : str, default 'zen'
-        Zenith angle column [degrees]; computed when missing.
-    ghi_col : str, default 'Global'
-        Observed GHI column.
-    dni_col : str, default 'Direct'
-        Observed DNI column.
-    dhi_col : str, default 'Diffuse'
-        Observed DHI column.
-    pred_cols : sequence of str, optional
-        Predicted columns that must be finite for a row to be kept.
-    max_zen : float, default 85
-        Rows kept only where `zen < max_zen` (default 85).
-    min_ghi : float, default 50
-        Rows kept only where `ghi > min_ghi` (default 50).
-    require_positive : bool, default True
-        When `True` (default), also require `dni > 0` and `dhi > 0`.
-
-    Returns
-    -------
-    pandas.DataFrame — filtered copy of `data`.
-    """
+    """Filter data for DHI and DNI separation evaluation."""
     data = data.copy()
 
     if zen_col not in data.columns:
@@ -661,34 +380,7 @@ def filter_sep_data(data, latitude, longitude, time_col="Timestamp", zen_col="ze
 
 
 def plot_columns(data, y_cols, labels=None, x_col=None, title="Data comparison", ylabel="Value", marker=True):
-    """
-    Plot selected columns in one figure.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table to plot.
-    y_cols : sequence of str
-        Columns drawn as y series.
-    labels : sequence of str, optional
-        Legend labels; defaults to `y_cols`.
-    x_col : str, optional
-        Datetime x column; falls back to the sample index when absent.
-    title : str, default 'Data comparison'
-        Figure title.
-    ylabel : str, default 'Value'
-        Y-axis label.
-    marker : bool, default True
-        Draw point markers on each series (default `True`).
-
-    Returns
-    -------
-    None — the figure is displayed and closed; it is not returned.
-
-    Notes
-    -----
-    All plotting functions use `matplotlib`. Each one builds a figure, calls `plt.tight_layout()`, then `plt.show()` and `plt.close()`. Figures are displayed immediately and not returned; use an `Agg` backend or a monkey-patched `plt.show` to capture files instead of windows.
-    """
+    """Plot selected columns in one figure."""
     if labels is None:
         labels = y_cols
 
@@ -720,28 +412,7 @@ def plot_columns(data, y_cols, labels=None, x_col=None, title="Data comparison",
 
 
 def plot_clearsky(data, model_cols, x_col=None, components=("ghi", "dni", "dhi")):
-    """
-    Plot multiple clear-sky models.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table holding clear-sky model outputs.
-    model_cols : dict
-        Maps a model name to `[ghi_col, dni_col, dhi_col]`.
-    x_col : str, optional
-        Datetime x column; falls back to the sample index when absent.
-    components : tuple of str, default ('ghi', 'dni', 'dhi')
-        Which components to draw, any of `"ghi"`, `"dni"`, `"dhi"`.
-
-    Returns
-    -------
-    None — the figure is displayed and closed; it is not returned.
-
-    Notes
-    -----
-    All plotting functions use `matplotlib`. Each one builds a figure, calls `plt.tight_layout()`, then `plt.show()` and `plt.close()`. Figures are displayed immediately and not returned; use an `Agg` backend or a monkey-patched `plt.show` to capture files instead of windows.
-    """
+    """Plot multiple clear-sky models."""
     if x_col is not None and x_col in data.columns:
         x = pd.to_datetime(data[x_col], errors="coerce")
         xlabel = x_col
@@ -783,30 +454,7 @@ def plot_clearsky(data, model_cols, x_col=None, components=("ghi", "dni", "dhi")
 
 
 def plot_csd(data, ghi_col="ghi", clear_col="ghi_clear", csd_col="csd", max_points=3000):
-    """
-    Plot clear-sky detection results.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table with observed, clear-sky and detection columns.
-    ghi_col : str, default 'ghi'
-        Observed GHI column.
-    clear_col : str, default 'ghi_clear'
-        Clear-sky GHI column.
-    csd_col : str, default 'csd'
-        Detection flag column (`0` = clear sky).
-    max_points : int, default 3000
-        Downsampling cap for long series (default 3000).
-
-    Returns
-    -------
-    None — the figure is displayed and closed; it is not returned.
-
-    Notes
-    -----
-    All plotting functions use `matplotlib`. Each one builds a figure, calls `plt.tight_layout()`, then `plt.show()` and `plt.close()`. Figures are displayed immediately and not returned; use an `Agg` backend or a monkey-patched `plt.show` to capture files instead of windows.
-    """
+    """Plot clear-sky detection results."""
     plot_data = data[[ghi_col, clear_col, csd_col]].dropna(subset=[ghi_col, clear_col]).copy()
 
     if len(plot_data) > max_points:
@@ -840,38 +488,7 @@ def plot_csd(data, ghi_col="ghi", clear_col="ghi_clear", csd_col="csd", max_poin
 
 
 def plot_series(data, obs_col, pred_col, obs_label="Observed", pred_label="Predicted", title="Series Comparison", ylabel="Value", threshold=0, max_value=None):
-    """
-    Plot two series for comparison.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        Table with the two series to compare.
-    obs_col : str
-        Observed series column.
-    pred_col : str
-        Predicted series column.
-    obs_label : str, default 'Observed'
-        Legend label for the observed series.
-    pred_label : str, default 'Predicted'
-        Legend label for the predicted series.
-    title : str, default 'Series Comparison'
-        Figure title.
-    ylabel : str, default 'Value'
-        Y-axis label.
-    threshold : float, default 0
-        Only rows where either series exceeds `threshold` are plotted (default 0).
-    max_value : float, optional
-        When given, values above it are hidden (set to NaN).
-
-    Returns
-    -------
-    None — the figure is displayed and closed; it is not returned.
-
-    Notes
-    -----
-    Negative values in both series are hidden. Raises `RuntimeError` when no row exceeds `threshold`. All plotting functions use `matplotlib`. Each one builds a figure, calls `plt.tight_layout()`, then `plt.show()` and `plt.close()`. Figures are displayed immediately and not returned; use an `Agg` backend or a monkey-patched `plt.show` to capture files instead of windows.
-    """
+    """Plot two series for comparison."""
     plot_data = data[[obs_col, pred_col]].copy()
     plot_data.loc[plot_data[obs_col] < 0, obs_col] = np.nan
     plot_data.loc[plot_data[pred_col] < 0, pred_col] = np.nan

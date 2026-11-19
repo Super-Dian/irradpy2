@@ -14,7 +14,7 @@ GHI forecasting, and evaluation.
 |---|---|
 | `getirrad` | Ground observations from BSRN, MIDC, SOLRAD, SRML, and SURFRAD |
 | `getgridded` | Point and area data from MERRA-2, ERA5, and CAMS |
-| `clear_sky` | 62 clear-sky irradiance models |
+| `clear_sky` | 92 Clear-sky irradiance models |
 | `csd` | 23 clear-sky detection methods |
 | `separation` | 7 irradiance separation models |
 | `forecast` | Persistence, ARIMA, RNN, LSTM, and Informer forecasting |
@@ -28,23 +28,21 @@ Python 3.10 or newer is required.
 pip install irradpy2
 ```
 
+## Common units
+
+- Irradiance — W/m²
+- Temperature — °C
+- Pressure — hPa
+- Relative humidity — %
+- Wind speed and direction — m/s and °
+- Precipitation and snow — mm (mm/h for rates)
+
 ## Examples
 
-Three examples in `irradpy2/example/` demonstrate end-to-end workflows
-from data download and preparation to analysis and visualization.
-
-| Example | Workflow | Modules covered |
-|---|---|---|
-| `ex_download_basic.py` | Download observations, preprocess and inspect the data, and plot irradiance | `getirrad`, `tool` |
-| `ex_clearsky_csd.py` | Download and prepare data, calculate clear-sky irradiance, detect clear-sky periods, and visualize results | `getirrad`, `clear_sky`, `csd`, `tool` |
-| `ex_separation_forecast.py` | Download and prepare data, estimate DNI and DHI, forecast GHI, and evaluate and visualize results | `getirrad`, `separation`, `forecast`, `tool` |
-
-Run the examples from the project root:
-
 ```bash
-python irradpy2/example/ex_download_basic.py
-python irradpy2/example/ex_clearsky_csd.py
-python irradpy2/example/ex_separation_forecast.py
+python -m irradpy2.example.ex_download_basic
+python -m irradpy2.example.ex_clearsky_csd
+python -m irradpy2.example.ex_separation_forecast
 ```
 
 ## Function documentation

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "irradpy2"
-version = "1.1.0"
+version = "1.2.0"
 description = "Multi-source solar irradiance data acquisition, modeling, separation, and forecasting toolkit."
 readme = "readme.md"
 requires-python = ">=3.10"
@@ -36,6 +36,14 @@ dependencies = [
     "pytz",
     "scikit-learn",
     "torch",
+    "scipy",
+    "statsmodels",
+    "cdsapi>=0.7.7",
+    "netCDF4",
+    "xarray",
+    "dask[array]",
+    "earthaccess",
+    "pydap>=3.5.9",
 ]
 
 [project.urls]
@@ -44,3 +52,6 @@ Repository = "https://github.com/Super-Dian/irradpy2"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"irradpy2.clear_sky" = ["AEROSOL-TABLE.txt", "adelaide_airport_inputs_sample.csv"]

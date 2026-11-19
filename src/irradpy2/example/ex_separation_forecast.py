@@ -1,8 +1,8 @@
-"""Example 3: DNI/DHI separation, GHI persistence forecast, and evaluation.
+"""Example 3: DNI/DHI separation and GHI persistence forecasting.
 
 Separates a recent SURFRAD day into DNI/DHI with Engerer2, evaluates the
 separation against the measured components, then forecasts GHI with a
-persistence model and scores it. Reuses the ./data/ cache when present.
+persistence model. Reuses the ./data/ cache when present.
 """
 
 from datetime import date, timedelta
@@ -16,7 +16,7 @@ import pandas as pd
 from irradpy2.forecast import forecast_persistence
 from irradpy2.getirrad import download_surfrad
 from irradpy2.separation import engerer2
-from irradpy2.tool import cal_metrics, filter_sep_data, merge_columns, plot_series, read_csv
+from irradpy2.tool import cal_metrics, filter_sep_data, merge_columns, plot_columns, read_csv
 
 SITE, LAT, LON = "bon", 40.05, -88.37  # SURFRAD Bondville, IL
 DATA_DIR = Path("data")  # written under the current working directory
@@ -42,8 +42,9 @@ csv_path = DATA_DIR / f"surfrad_{SITE}_{day}.csv"
 if not csv_path.exists():  # cache: skip the download on re-runs
     download_surfrad(SITE, day, day, str(csv_path))
 
-data = read_csv(csv_path).replace(-999.9, np.nan).dropna(subset=["ghi", "dni", "dhi"])
-assert not data.empty, f"{csv_path} has no usable rows; delete it and re-run"
+observations = read_csv(csv_path).replace(-999.9, np.nan)
+data = observations.dropna(subset=["ghi", "dni", "dhi"])
+assert not data.empty, f"{csv_path} has no usable rows for separation; delete it and re-run"
 
 datetime = pd.to_datetime(data["UTC_time"]).to_numpy()
 
@@ -62,13 +63,11 @@ print("Engerer2 vs measured:",
        cal_metrics(sep, obs_col="dni", pred_col="dni_pred").items()},
       "(DNI)")
 
-# persistence forecast: horizon = 6 steps ahead (6 minutes at 1-min data)
-obs, pred = forecast_persistence(datetime, data["ghi"].to_numpy(), horizon=6)
-scored = obs.merge(pred, on="Timestamp")
-metrics = cal_metrics(scored, obs_col="Global", pred_col="pre_Global")
-print("persistence GHI forecast:", {k: round(float(v), 2) for k, v in metrics.items()})
-
-plot_series(scored, obs_col="Global", pred_col="pre_Global",
-            obs_label="Observed", pred_label="Persistence (6 min ahead)",
-            title=f"SURFRAD {SITE} {day} GHI persistence forecast",
-            ylabel="GHI (W m$^{-2}$)")
+# Forecast using all available GHI, including rows with missing DNI or DHI.
+_, future = forecast_persistence(
+    observations["UTC_time"], observations["ghi"], forecast_duration="6min"
+)
+print(future.to_string(index=False))
+plot_columns(future, ["pre_Global"], labels=["Persistence forecast"], x_col="Timestamp",
+             title=f"SURFRAD {SITE} {day} GHI persistence forecast",
+             ylabel="GHI (W m$^{-2}$)")

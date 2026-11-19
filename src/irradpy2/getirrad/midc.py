@@ -24,6 +24,16 @@ import pandas as pd
 from .necessary_main import http_get_with_retry, read_flexible_csv, attach_local_and_offset, clip_by_local_date, expand_unnamed_columns
 
 
+# MIDC puts the archive's local-time zone in the time-column header.
+_MIDC_STANDARD_ZONES = {
+    "PST": "Etc/GMT+8",
+    "MST": "Etc/GMT+7",
+    "CST": "Etc/GMT+6",
+    "EST": "Etc/GMT+5",
+    "HST": "Etc/GMT+10",
+}
+
+
 SITE_COLUMN_MAP = {
     "BMS": {
         'Global CMP22 (vent/cor) [W/m^2]': 'ghi',
@@ -33,6 +43,8 @@ SITE_COLUMN_MAP = {
         'Avg Wind Speed @ 6ft [m/s]': 'wind_speed',
         'Tower Dry Bulb Temp [deg C]': 'temp_air',
         'Tower RH [%]': 'relative_humidity',
+        "Station Pressure [mBar]": "pressure",
+        "Precipitation [mm]": "precipitation",
         "Total Cloud Cover [%]": "cloud_fraction",
         "Opaque Cloud Cover [%]": "opaque_cloud_fraction"
     },
@@ -108,8 +120,10 @@ SITE_COLUMN_MAP = {
     "NELHA": {
         "Global Horizontal [W/m^2]": "ghi",
         "Air Temperature [W/m^2]": "temp_air",
+        "Air Temperature [deg C]": "temp_air",
         "Avg Wind Speed @ 10m [m/s]": "wind_speed",
         "Rel Humidity [%]": "rh",
+        "Station Pressure [mBar]": "pressure",
     },
     "ULL": {
         "Direct Normal [W/m^2]": "dni",
@@ -190,6 +204,12 @@ def download_midc(site: str, start: str, end: str, save_path: str):
     save_path : str
         Output CSV file path.
 
+    Notes
+    -----
+    Station pressure reported in millibars is numerically equal to hPa.
+    Precipitation fields mapped here already use millimeters. MIDC cloud
+    cover values remain in percent.
+
     Returns
     -------
     None
@@ -206,7 +226,7 @@ def download_midc(site: str, start: str, end: str, save_path: str):
     cur = start_dt.replace(day=1)
     while cur.date() <= end_dt.date():
         nxt = cur.replace(year=cur.year + 1, month=1, day=1) if cur.month == 12 else cur.replace(month=cur.month + 1, day=1)
-        months.append((cur, nxt - timedelta(days=1)))
+        months.append((max(cur, start_dt), min(nxt - timedelta(days=1), end_dt)))
         cur = nxt
 
     base_url = "https://midcdmz.nlr.gov/apps/data_api.pl"
@@ -215,7 +235,9 @@ def download_midc(site: str, start: str, end: str, save_path: str):
 
     def fast_read_csv(text: str) -> pd.DataFrame:
         try:
-            return pd.read_csv(StringIO(text), sep=",", engine="c", on_bad_lines="skip")
+            # Extra unlabeled fields must not cause pandas to infer an index
+            # and shift fields such as Year, DOY, or the station time column.
+            return pd.read_csv(StringIO(text), sep=",", engine="c", index_col=False, on_bad_lines="skip")
         except Exception:
             return read_flexible_csv(text)
 
@@ -243,6 +265,7 @@ def download_midc(site: str, start: str, end: str, save_path: str):
 
         out = df.loc[mask].copy()
         out.insert(0, "_naive_local", naive_local.loc[mask].values)
+        out["_time_zone"] = _MIDC_STANDARD_ZONES.get(time_col.strip().upper(), time_col.strip())
         return out
 
     parts = []
@@ -266,18 +289,11 @@ def download_midc(site: str, start: str, end: str, save_path: str):
     parts.sort(key=lambda x: x[0])
     final_df = pd.concat([p[1] for p in parts], ignore_index=True)
 
-    ns = pd.to_datetime(final_df["_naive_local"].values)
-    ns = pd.Series(ns, index=final_df.index)
-
-    key_min = ns.dt.strftime("%Y-%m-%d %H:%M")
-    dup_mask = key_min.duplicated(keep=False)
-    first_of_dup = ~key_min.duplicated(keep="first") & dup_mask
-
-    ambiguous_vec = pd.Series(False, index=ns.index)
-    ambiguous_vec[first_of_dup] = True
-
-    local_ts = ns.dt.tz_localize("America/Denver", nonexistent="shift_forward", ambiguous=ambiguous_vec.values)
-    final_df = final_df.drop(columns=["_naive_local"])
+    time_zones = final_df.pop("_time_zone").unique()
+    if len(time_zones) != 1:
+        raise ValueError(f"MIDC changed time-zone headers for {site}: {list(time_zones)}")
+    tz_name = time_zones[0]
+    local_ts = final_df.pop("_naive_local").dt.tz_localize(tz_name)
     final_df = attach_local_and_offset(final_df, local_ts)
     final_df = final_df.rename(columns={"Local_Time": "local_time", "UTC_Offset": "utc_offset"})
 
@@ -292,7 +308,7 @@ def download_midc(site: str, start: str, end: str, save_path: str):
     else:
         final_df = final_df[["UTC_time", "local_time", "utc_offset"]]
 
-    mask, _ = clip_by_local_date(local_ts, start, end, "America/Denver")
+    mask, _ = clip_by_local_date(local_ts, start, end, tz_name)
     final_df = final_df[mask].reset_index(drop=True)
     final_df = final_df.loc[:, ~final_df.columns.str.contains(r"^Unnamed", regex=True)]
     save_dir = os.path.dirname(save_path)

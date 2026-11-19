@@ -25,18 +25,19 @@ Supported input shapes:
 - datetime: (n,) or (n, 1)
 - ghi: (n,) or (n, 1)
 
-The output contains two pandas DataFrame objects:
-- ori_data: original Global irradiance values with Timestamp
-- pre_data: predicted Global irradiance values with Timestamp
+Each public function returns two pandas DataFrames:
+- ori_data: the historical input used, with Timestamp and Global
+- pre_data: future timestamps with pre_Global in W/m2
+
+Timestamps are UTC; naive inputs are interpreted as UTC.
+Choose forecast_duration (e.g. "30min" or "1h") or horizon (number of steps).
+The default is six steps at the input cadence. The forecast origin is the latest
+usable sample at or before as_of, or the latest usable sample if as_of is omitted.
 """
 
-import copy
 import math
 import numpy as np
 import pandas as pd
-
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
 
 import torch
 import torch.nn as nn
@@ -46,210 +47,105 @@ from torch.utils.data import Dataset, DataLoader
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def prepare_ghi_array(datetime, ghi):
-    """
-    Prepare datetime and GHI arrays.
+def _forecast_window(datetime, ghi, horizon, forecast_duration, as_of):
+    """Select the latest contiguous history and construct the future timestamps."""
+    time = np.asarray(datetime)
+    y = np.asarray(ghi, dtype=float)
+    if time.ndim == 2 and time.shape[1] == 1:
+        time = time[:, 0]
+    if y.ndim == 2 and y.shape[1] == 1:
+        y = y[:, 0]
+    if time.ndim != 1 or y.ndim != 1 or len(time) != len(y):
+        raise ValueError("datetime and ghi must be equally sized one-dimensional series.")
 
-    Parameters
-    ----------
-    datetime : numpy.ndarray
-        Datetime sequence with shape (n,) or (n, 1).
-    ghi : numpy.ndarray
-        GHI sequence with shape (n,) or (n, 1).
+    history = pd.DataFrame({
+        "Timestamp": pd.to_datetime(time, errors="coerce", utc=True).tz_convert(None),
+        "Global": y,
+    })
+    history["Global"] = history["Global"].replace(
+        [np.inf, -np.inf, -9999, -999.99, -999.9, -999, -99], np.nan
+    ).clip(lower=0)
+    history = history.dropna(subset=["Timestamp"]).sort_values("Timestamp", kind="stable")
+    history = history.drop_duplicates("Timestamp", keep="last")
 
-    Returns
-    -------
-    time : pandas.Series
-        Cleaned datetime sequence.
-    y : numpy.ndarray
-        Cleaned one-dimensional GHI array.
-    """
-    if not isinstance(datetime, np.ndarray):
-        raise TypeError("datetime must be a numpy ndarray.")
+    cutoff = None
+    if as_of is not None:
+        cutoff = pd.to_datetime(as_of, utc=True)
+        if pd.isna(cutoff):
+            raise ValueError("as_of must be a valid timestamp.")
+        cutoff = cutoff.tz_convert(None)
+        history = history[history["Timestamp"] <= cutoff]
 
-    if not isinstance(ghi, np.ndarray):
-        raise TypeError("ghi must be a numpy ndarray.")
+    intervals = history["Timestamp"].diff().value_counts()
+    if intervals.empty:
+        raise ValueError("At least two historical timestamps are required to infer the sampling interval.")
+    if len(intervals) > 1 and intervals.iloc[0] == intervals.iloc[1]:
+        raise ValueError("The historical sampling interval is ambiguous. Supply a regularly sampled series.")
+    interval = intervals.index[0]
 
-    datetime_arr = np.asarray(datetime)
+    history = history.dropna(subset=["Global"])
+    if history.empty:
+        raise ValueError("No usable historical GHI is available at the forecast origin.")
+    breaks = history["Timestamp"].diff().ne(interval).to_numpy()
+    history = history.iloc[np.flatnonzero(breaks)[-1]:].reset_index(drop=True)
+    origin = history["Timestamp"].iloc[-1]
 
-    if datetime_arr.ndim == 1:
-        time = datetime_arr
-    elif datetime_arr.ndim == 2 and datetime_arr.shape[1] == 1:
-        time = datetime_arr[:, 0]
-    else:
-        raise ValueError("datetime must have shape (n,) or (n, 1).")
+    if cutoff is not None and origin + interval <= cutoff:
+        raise ValueError("The latest usable GHI is at least one sampling interval older than as_of.")
 
-    ghi_arr = np.asarray(ghi, dtype=float)
+    if forecast_duration is not None:
+        if horizon is not None:
+            raise ValueError("Specify either forecast_duration or horizon.")
+        if not isinstance(forecast_duration, (str, pd.Timedelta)):
+            raise ValueError("Use a duration such as '30min' or '1h'.")
+        duration = pd.Timedelta(forecast_duration)
+        if pd.isna(duration) or duration <= pd.Timedelta(0) or duration % interval:
+            raise ValueError(f"forecast_duration must be a positive multiple of {interval}.")
+        horizon = duration // interval
+    elif horizon is None:
+        horizon = 6
 
-    if ghi_arr.ndim == 1:
-        y = ghi_arr
-    elif ghi_arr.ndim == 2 and ghi_arr.shape[1] == 1:
-        y = ghi_arr[:, 0]
-    else:
-        raise ValueError("ghi must have shape (n,) or (n, 1).")
-
-    if len(time) != len(y):
-        raise ValueError("datetime and ghi must have the same length.")
-
-    df = pd.DataFrame({"Timestamp": pd.to_datetime(time, errors="coerce"), "Global": y})
-    df = df.dropna(subset=["Timestamp"])
-    df["Global"] = df["Global"].replace([-9999, -999, -99], np.nan)
-    df["Global"] = df["Global"].ffill().bfill()
-
-    if df["Global"].isna().any():
-        raise ValueError("ghi contains only missing or invalid values.")
-
-    df["Global"] = df["Global"].clip(lower=0)
-    df = df.sort_values("Timestamp").reset_index(drop=True)
-
-    time = df["Timestamp"]
-    y = df["Global"].to_numpy(dtype=float)
-
-    return time, y
-
-
-def forecast_persistence(datetime, ghi, horizon=6, test_ratio=0.15):
-    """
-    Forecast Global irradiance using persistence.
-
-    Persistence assumes that future irradiance remains equal to
-    the most recent observed irradiance.
-
-    Parameters
-    ----------
-    datetime : numpy.ndarray
-        Datetime sequence, shape (n,) or (n, 1); parsed with
-        ``pandas.to_datetime`` (unparseable rows are dropped).
-    ghi : numpy.ndarray
-        Global horizontal irradiance, shape (n,) or (n, 1), same length as
-        ``datetime`` [W m-2].
-    horizon : int, default 6
-        Forecast lead in samples: the prediction at time ``t`` is the
-        observation at ``t - horizon``.
-    test_ratio : float, default 0.15
-        Trailing fraction of the time-sorted series used as the evaluation
-        window.
-
-    Returns
-    -------
-    ori_data : pandas.DataFrame
-        Observed values over the evaluation window: columns ``Timestamp``,
-        ``Global``.
-    pre_data : pandas.DataFrame
-        Predictions on the same timestamps: columns ``Timestamp``,
-        ``pre_Global``.
-
-    Notes
-    -----
-    The evaluation window starts at
-    ``max(int(n * (1 - test_ratio)), horizon)``; predictions are clipped
-    at 0. Both arguments must be ``numpy.ndarray`` (TypeError otherwise)
-    with matching lengths and shapes (n,) or (n, 1); invalid timestamps are
-    dropped, sentinel values -9999/-999/-99 are gap-filled forward then
-    backward, negative GHI is clipped to 0, and the series is sorted by
-    time. ``ValueError`` is raised when GHI is entirely missing or the
-    series is too short.
-    """
-    time, y = prepare_ghi_array(datetime, ghi)
-
-    test_start = int(len(y) * (1 - test_ratio))
-    start = max(test_start, horizon)
-
-    if start >= len(y):
-        raise ValueError("Data length is too short for the current horizon and test_ratio.")
-
-    y_true = y[start:]
-    y_pred = y[start - horizon:len(y) - horizon]
-    y_pred = np.clip(y_pred, 0, None)
-
-    target_time = time.iloc[start:].to_numpy()
-
-    ori_data = pd.DataFrame({"Timestamp": target_time, "Global": y_true})
-    pre_data = pd.DataFrame({"Timestamp": target_time, "pre_Global": y_pred})
-
-    return ori_data, pre_data
+    if not isinstance(horizon, (int, np.integer)) or isinstance(horizon, (bool, np.bool_)) or horizon < 1:
+        raise ValueError("horizon must be a positive integer number of steps.")
+    future = pd.date_range(start=origin + interval, periods=horizon, freq=interval)
+    return history, future
 
 
-def forecast_arima(datetime, ghi, order=(2, 1, 2), test_ratio=0.15):
-    """
-    Forecast Global irradiance using ARIMA.
+def _prediction_frame(future, values):
+    return pd.DataFrame({"Timestamp": future, "pre_Global": np.clip(values, 0, None)})
 
-    Parameters
-    ----------
-    datetime : numpy.ndarray
-        Datetime sequence, shape (n,) or (n, 1); parsed with
-        ``pandas.to_datetime`` (unparseable rows are dropped).
-    ghi : numpy.ndarray
-        Global horizontal irradiance, shape (n,) or (n, 1), same length as
-        ``datetime`` [W m-2].
-    order : tuple of int, default (2, 1, 2)
-        ARIMA (p, d, q) order passed to ``statsmodels.tsa.arima.model.ARIMA``.
-    test_ratio : float, default 0.15
-        Trailing fraction of the time-sorted series used as the test window.
 
-    Returns
-    -------
-    ori_data : pandas.DataFrame
-        Observed values over the test window: columns ``Timestamp``,
-        ``Global``.
-    pre_data : pandas.DataFrame
-        Predictions on the same timestamps: columns ``Timestamp``,
-        ``pre_Global``.
+def forecast_persistence(datetime, ghi, horizon=None, *, forecast_duration=None, as_of=None):
+    """Forecast future GHI by holding the last usable observation constant."""
+    history, future = _forecast_window(datetime, ghi, horizon, forecast_duration, as_of)
+    return history, _prediction_frame(future, np.full(len(future), history["Global"].iloc[-1]))
 
-    Notes
-    -----
-    Fits ARIMA on the first ``(1 - test_ratio)`` fraction (requires
-    ``statsmodels`` and at least 20 training samples, ``ValueError``
-    otherwise) and forecasts exactly ``len(test)`` steps; predictions are
-    clipped at 0. Both arguments must be ``numpy.ndarray`` (TypeError
-    otherwise) with matching lengths and shapes (n,) or (n, 1); invalid
-    timestamps are dropped, sentinel values -9999/-999/-99 are gap-filled
-    forward then backward, negative GHI is clipped to 0, and the series is
-    sorted by time. ``ValueError`` is raised when GHI is entirely missing
-    or the series is too short.
-    """
+
+def forecast_arima(datetime, ghi, order=(2, 1, 2), horizon=None, *, forecast_duration=None, as_of=None):
+    """Fit ARIMA to historical GHI and forecast the requested future steps."""
     from statsmodels.tsa.arima.model import ARIMA
 
-    time, y = prepare_ghi_array(datetime, ghi)
-
-    test_start = int(len(y) * (1 - test_ratio))
-    train_y = y[:test_start]
-    test_y = y[test_start:]
-
-    if len(train_y) < 20:
-        raise ValueError("Training data is too short for ARIMA.")
-
-    model = ARIMA(train_y, order=order)
-    fitted = model.fit()
-
-    y_pred = fitted.forecast(steps=len(test_y))
-    y_pred = np.clip(np.array(y_pred), 0, None)
-
-    target_time = time.iloc[test_start:].to_numpy()
-
-    ori_data = pd.DataFrame({"Timestamp": target_time, "Global": test_y})
-    pre_data = pd.DataFrame({"Timestamp": target_time, "pre_Global": y_pred})
-
-    return ori_data, pre_data
+    history, future = _forecast_window(datetime, ghi, horizon, forecast_duration, as_of)
+    y = history["Global"].to_numpy()
+    if len(y) < max(20, sum(order) + 2):
+        raise ValueError("Contiguous historical GHI is too short for the selected ARIMA order.")
+    values = np.repeat(y[-1], len(future)) if np.ptp(y) == 0 else ARIMA(y, order=order).fit().forecast(steps=len(future))
+    return history, _prediction_frame(future, values)
 
 
 class SeqDataset(Dataset):
-    """Sequence-to-one dataset."""
+    """Historical input windows with the next observed GHI as the target."""
 
-    def __init__(self, X, y, seq_len, horizon):
-        self.X = X
-        self.y = y
+    def __init__(self, scaled_ghi, seq_len):
+        self.scaled_ghi = torch.as_tensor(scaled_ghi, dtype=torch.float32)
         self.seq_len = seq_len
-        self.horizon = horizon
 
     def __len__(self):
-        return max(0, len(self.X) - self.seq_len - self.horizon + 1)
+        return len(self.scaled_ghi) - self.seq_len
 
     def __getitem__(self, index):
-        x = self.X[index:index + self.seq_len]
-        y = self.y[index + self.seq_len + self.horizon - 1]
-
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+        end = index + self.seq_len
+        return self.scaled_ghi[index:end, None], self.scaled_ghi[end]
 
 
 class RNNModel(nn.Module):
@@ -262,18 +158,6 @@ class RNNModel(nn.Module):
         self.fc = nn.Linear(hidden, 1)
 
     def forward(self, x):
-        """Map a batch of input windows to one scalar prediction each.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input windows with shape (batch, seq_len, in_dim).
-
-        Returns
-        -------
-        torch.Tensor
-            Predictions with shape (batch,).
-        """
         out, _ = self.rnn(x)
         out = out[:, -1, :]
         out = self.fc(out)
@@ -291,18 +175,6 @@ class LSTMModel(nn.Module):
         self.fc = nn.Linear(hidden, 1)
 
     def forward(self, x):
-        """Map a batch of input windows to one scalar prediction each.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input windows with shape (batch, seq_len, in_dim).
-
-        Returns
-        -------
-        torch.Tensor
-            Predictions with shape (batch,).
-        """
         out, _ = self.lstm(x)
         out = out[:, -1, :]
         out = self.fc(out)
@@ -329,18 +201,6 @@ class PositionalEncoding(nn.Module):
         self.pe = pe.unsqueeze(0)
 
     def forward(self, x):
-        """Add sinusoidal positional encoding to the embedded input.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Embedded sequence with shape (batch, seq_len, d_model).
-
-        Returns
-        -------
-        torch.Tensor
-            Input plus the positional encoding, same shape as ``x``.
-        """
         return x + self.pe[:, :x.size(1)].to(x.device)
 
 
@@ -351,14 +211,14 @@ class InformerModel(nn.Module):
     This is an Informer-style model, not a full original Informer implementation.
     """
 
-    def __init__(self, in_dim, d_model=128, nhead=4, num_layers=2):
+    def __init__(self, in_dim, d_model=128, nhead=4, num_layers=2, max_len=5000):
         super().__init__()
 
         if d_model % nhead != 0:
             raise ValueError("d_model must be divisible by nhead.")
 
         self.in_proj = nn.Linear(in_dim, d_model)
-        self.pos = PositionalEncoding(d_model)
+        self.pos = PositionalEncoding(d_model, max_len=max_len)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -372,18 +232,6 @@ class InformerModel(nn.Module):
         self.fc = nn.Linear(d_model, 1)
 
     def forward(self, x):
-        """Run projection, positional encoding and the transformer encoder.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input windows with shape (batch, seq_len, in_dim).
-
-        Returns
-        -------
-        torch.Tensor
-            Predictions with shape (batch,).
-        """
         x = self.in_proj(x)
         x = self.pos(x)
 
@@ -394,346 +242,81 @@ class InformerModel(nn.Module):
         return out.squeeze(-1)
 
 
-def _evaluate_model(model, loader):
-    """Evaluate model using validation loss."""
-    model.eval()
-
-    loss_fn = nn.MSELoss()
-    total_loss = 0
-
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb = xb.to(DEVICE)
-            yb = yb.to(DEVICE)
-
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
-
-            total_loss += loss.item() * len(xb)
-
-    return total_loss / len(loader.dataset)
-
-
-def _train_model(model, train_loader, val_loader, epochs=20, lr=1e-3):
-    """Train model and keep the best model state in memory."""
+def _train_model(model, train_loader, epochs=20, lr=1e-3):
+    """Fit a one-step model using all historical training windows."""
     model = model.to(DEVICE)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
+    model.train()
 
-    best_loss = float("inf")
-    best_state = copy.deepcopy(model.state_dict())
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-
+    for _ in range(epochs):
         for xb, yb in train_loader:
-            xb = xb.to(DEVICE)
-            yb = yb.to(DEVICE)
-
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             optimizer.zero_grad()
-
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
-
+            loss = loss_fn(model(xb), yb)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            total_loss += loss.item() * len(xb)
-
-        train_loss = total_loss / len(train_loader.dataset)
-        val_loss = _evaluate_model(model, val_loader)
-
-        print(f"Epoch {epoch + 1}/{epochs} | Train={train_loss:.4f} | Val={val_loss:.4f}")
-
-        if val_loss < best_loss:
-            best_loss = val_loss
-            best_state = copy.deepcopy(model.state_dict())
-
-    model.load_state_dict(best_state)
-
     return model
 
 
-def _forecast_deep_learning(datetime, ghi, model, seq_len=72, horizon=6, epochs=20, batch_size=64, lr=1e-3):
-    """
-    Shared deep learning forecasting process.
+def _forecast_deep_learning(
+    history, future, model, seq_len=72, epochs=20, batch_size=64, lr=1e-3,
+):
+    """Train once on the historical series, then predict one step at a time."""
+    y = history["Global"].to_numpy()
+    if not isinstance(seq_len, int) or seq_len < 1 or len(y) <= seq_len:
+        raise ValueError("Contiguous historical GHI must contain more samples than seq_len.")
+    if epochs < 1:
+        raise ValueError("epochs must be positive.")
+    if np.ptp(y) == 0:
+        return history, _prediction_frame(future, np.full(len(future), y[-1]))
 
-    datetime is used for sorting and output alignment.
-    ghi is used as the actual model input.
-    """
-    time, y = prepare_ghi_array(datetime, ghi)
-
-    X = y.reshape(-1, 1)
-
-    X_train, X_temp, y_train, y_temp, time_train, time_temp = train_test_split(
-        X, y, time, test_size=0.3, shuffle=False
-    )
-
-    X_val, X_test, y_val, y_test, time_val, time_test = train_test_split(
-        X_temp, y_temp, time_temp, test_size=0.5, shuffle=False
-    )
-
-    x_scaler = MinMaxScaler()
-
-    X_train = x_scaler.fit_transform(X_train)
-    X_val = x_scaler.transform(X_val)
-    X_test = x_scaler.transform(X_test)
-
-    y_max = np.nanmax(y_train)
-
-    if not np.isfinite(y_max) or y_max <= 0:
-        raise ValueError("Global irradiance maximum must be greater than 0.")
-
-    y_train = y_train / y_max
-    y_val = y_val / y_max
-    y_test = y_test / y_max
-
-    train_set = SeqDataset(X_train, y_train, seq_len, horizon)
-    val_set = SeqDataset(X_val, y_val, seq_len, horizon)
-    test_set = SeqDataset(X_test, y_test, seq_len, horizon)
-
-    if len(train_set) == 0 or len(val_set) == 0 or len(test_set) == 0:
-        raise ValueError("Data length is too short for the current seq_len and horizon.")
-
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
-
-    model = _train_model(model=model, train_loader=train_loader, val_loader=val_loader, epochs=epochs, lr=lr)
-
+    scale = y.max()
+    scaled = y / scale
+    dataset = SeqDataset(scaled, seq_len)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    model = _train_model(model, loader, epochs=epochs, lr=lr)
     model.eval()
 
-    y_true = []
-    y_pred = []
-
+    window = torch.tensor(scaled[-seq_len:], dtype=torch.float32, device=DEVICE)
+    predictions = []
     with torch.no_grad():
-        for xb, yb in test_loader:
-            xb = xb.to(DEVICE)
+        for _ in future:
+            value = model(window[None, :, None]).reshape(1).clamp_min(0)
+            predictions.append(value)
+            window = torch.cat((window[1:], value))
+        values = torch.cat(predictions).cpu().numpy() * scale
 
-            pred = model(xb).cpu().numpy()
-
-            y_pred.extend(pred)
-            y_true.extend(yb.numpy())
-
-    y_true = np.array(y_true) * y_max
-    y_pred = np.clip(np.array(y_pred), 0, None) * y_max
-
-    time_test = pd.Series(time_test).reset_index(drop=True)
-
-    target_index = np.arange(len(y_true)) + seq_len + horizon - 1
-    target_time = time_test.iloc[target_index].to_numpy()
-
-    ori_data = pd.DataFrame({"Timestamp": target_time, "Global": y_true})
-    pre_data = pd.DataFrame({"Timestamp": target_time, "pre_Global": y_pred})
-
-    return ori_data, pre_data
+    return history, _prediction_frame(future, values)
 
 
-def forecast_rnn(datetime, ghi, seq_len=72, horizon=6, epochs=20, batch_size=64, lr=1e-3, hidden=128):
-    """
-    Forecast Global irradiance using an RNN.
-
-    Parameters
-    ----------
-    datetime : numpy.ndarray
-        Datetime sequence, shape (n,) or (n, 1); parsed with
-        ``pandas.to_datetime`` (unparseable rows are dropped).
-    ghi : numpy.ndarray
-        Global horizontal irradiance, shape (n,) or (n, 1), same length as
-        ``datetime`` [W m-2].
-    seq_len : int, default 72
-        Input window length in samples fed to the model.
-    horizon : int, default 6
-        Gap in samples between the end of the input window and the target
-        sample.
-    epochs : int, default 20
-        Training epochs; the best validation-loss state is kept.
-    batch_size : int, default 64
-        Mini-batch size.
-    lr : float, default 0.001
-        Adam learning rate.
-    hidden : int, default 128
-        Hidden units of the RNN layer.
-
-    Returns
-    -------
-    ori_data : pandas.DataFrame
-        Observed values over the test window: columns ``Timestamp``,
-        ``Global``.
-    pre_data : pandas.DataFrame
-        Predictions on the same timestamps: columns ``Timestamp``,
-        ``pre_Global``.
-
-    Notes
-    -----
-    Requires ``torch``. The shared pipeline makes a chronological 70/15/15
-    train/validation/test split (no shuffling), scales inputs with
-    ``MinMaxScaler``, divides targets by the training-set maximum, trains
-    with Adam and keeps the best validation-loss epoch (per-epoch progress
-    is printed to stdout). The returned frames cover the test window;
-    predictions are clipped at 0. Both arguments must be ``numpy.ndarray``
-    (TypeError otherwise) with matching lengths and shapes (n,) or (n, 1);
-    invalid timestamps are dropped, sentinel values -9999/-999/-99 are
-    gap-filled forward then backward, negative GHI is clipped to 0, and the
-    series is sorted by time. ``ValueError`` is raised when GHI is entirely
-    missing or the series is too short.
-    """
+def forecast_rnn(
+    datetime, ghi, seq_len=72, horizon=None, epochs=20, batch_size=64, lr=1e-3,
+    hidden=128, *, forecast_duration=None, as_of=None,
+):
+    """Forecast future GHI recursively with an RNN."""
+    history, future = _forecast_window(datetime, ghi, horizon, forecast_duration, as_of)
     model = RNNModel(in_dim=1, hidden=hidden)
-
-    return _forecast_deep_learning(
-        datetime=datetime,
-        ghi=ghi,
-        model=model,
-        seq_len=seq_len,
-        horizon=horizon,
-        epochs=epochs,
-        batch_size=batch_size,
-        lr=lr
-    )
+    return _forecast_deep_learning(history, future, model, seq_len, epochs, batch_size, lr)
 
 
-def forecast_lstm(datetime, ghi, seq_len=72, horizon=6, epochs=20, batch_size=64, lr=1e-3, hidden=128):
-    """
-    Forecast Global irradiance using an LSTM.
-
-    Parameters
-    ----------
-    datetime : numpy.ndarray
-        Datetime sequence, shape (n,) or (n, 1); parsed with
-        ``pandas.to_datetime`` (unparseable rows are dropped).
-    ghi : numpy.ndarray
-        Global horizontal irradiance, shape (n,) or (n, 1), same length as
-        ``datetime`` [W m-2].
-    seq_len : int, default 72
-        Input window length in samples fed to the model.
-    horizon : int, default 6
-        Gap in samples between the end of the input window and the target
-        sample.
-    epochs : int, default 20
-        Training epochs; the best validation-loss state is kept.
-    batch_size : int, default 64
-        Mini-batch size.
-    lr : float, default 0.001
-        Adam learning rate.
-    hidden : int, default 128
-        Hidden units of the LSTM layer.
-
-    Returns
-    -------
-    ori_data : pandas.DataFrame
-        Observed values over the test window: columns ``Timestamp``,
-        ``Global``.
-    pre_data : pandas.DataFrame
-        Predictions on the same timestamps: columns ``Timestamp``,
-        ``pre_Global``.
-
-    Notes
-    -----
-    Requires ``torch``. The shared pipeline makes a chronological 70/15/15
-    train/validation/test split (no shuffling), scales inputs with
-    ``MinMaxScaler``, divides targets by the training-set maximum, trains
-    with Adam and keeps the best validation-loss epoch (per-epoch progress
-    is printed to stdout). The returned frames cover the test window;
-    predictions are clipped at 0. Both arguments must be ``numpy.ndarray``
-    (TypeError otherwise) with matching lengths and shapes (n,) or (n, 1);
-    invalid timestamps are dropped, sentinel values -9999/-999/-99 are
-    gap-filled forward then backward, negative GHI is clipped to 0, and the
-    series is sorted by time. ``ValueError`` is raised when GHI is entirely
-    missing or the series is too short.
-    """
+def forecast_lstm(
+    datetime, ghi, seq_len=72, horizon=None, epochs=20, batch_size=64, lr=1e-3,
+    hidden=128, *, forecast_duration=None, as_of=None,
+):
+    """Forecast future GHI recursively with an LSTM."""
+    history, future = _forecast_window(datetime, ghi, horizon, forecast_duration, as_of)
     model = LSTMModel(in_dim=1, hidden=hidden)
-
-    return _forecast_deep_learning(
-        datetime=datetime,
-        ghi=ghi,
-        model=model,
-        seq_len=seq_len,
-        horizon=horizon,
-        epochs=epochs,
-        batch_size=batch_size,
-        lr=lr
-    )
+    return _forecast_deep_learning(history, future, model, seq_len, epochs, batch_size, lr)
 
 
 def forecast_informer(
-    datetime,
-    ghi,
-    seq_len=72,
-    horizon=6,
-    epochs=20,
-    batch_size=64,
-    lr=1e-3,
-    d_model=128,
-    nhead=4,
-    num_layers=2
+    datetime, ghi, seq_len=72, horizon=None, epochs=20, batch_size=64, lr=1e-3,
+    d_model=128, nhead=4, num_layers=2, *, forecast_duration=None, as_of=None,
 ):
-    """
-    Forecast Global irradiance using an Informer-style model.
-
-    Parameters
-    ----------
-    datetime : numpy.ndarray
-        Datetime sequence, shape (n,) or (n, 1); parsed with
-        ``pandas.to_datetime`` (unparseable rows are dropped).
-    ghi : numpy.ndarray
-        Global horizontal irradiance, shape (n,) or (n, 1), same length as
-        ``datetime`` [W m-2].
-    seq_len : int, default 72
-        Input window length in samples fed to the model.
-    horizon : int, default 6
-        Gap in samples between the end of the input window and the target
-        sample.
-    epochs : int, default 20
-        Training epochs; the best validation-loss state is kept.
-    batch_size : int, default 64
-        Mini-batch size.
-    lr : float, default 0.001
-        Adam learning rate.
-    d_model : int, default 128
-        Transformer embedding dimension; must be divisible by ``nhead``
-        (``ValueError`` otherwise).
-    nhead : int, default 4
-        Number of attention heads.
-    num_layers : int, default 2
-        Number of transformer encoder layers.
-
-    Returns
-    -------
-    ori_data : pandas.DataFrame
-        Observed values over the test window: columns ``Timestamp``,
-        ``Global``.
-    pre_data : pandas.DataFrame
-        Predictions on the same timestamps: columns ``Timestamp``,
-        ``pre_Global``.
-
-    Notes
-    -----
-    A lightweight Informer-style Transformer, not the full original
-    Informer implementation. Requires ``torch``. The shared pipeline makes
-    a chronological 70/15/15 train/validation/test split (no shuffling),
-    scales inputs with ``MinMaxScaler``, divides targets by the
-    training-set maximum, trains with Adam and keeps the best
-    validation-loss epoch (per-epoch progress is printed to stdout). The
-    returned frames cover the test window; predictions are clipped at 0.
-    Both arguments must be ``numpy.ndarray`` (TypeError otherwise) with
-    matching lengths and shapes (n,) or (n, 1); invalid timestamps are
-    dropped, sentinel values -9999/-999/-99 are gap-filled forward then
-    backward, negative GHI is clipped to 0, and the series is sorted by
-    time. ``ValueError`` is raised when GHI is entirely missing or the
-    series is too short.
-    """
-    model = InformerModel(in_dim=1, d_model=d_model, nhead=nhead, num_layers=num_layers)
-
-    return _forecast_deep_learning(
-        datetime=datetime,
-        ghi=ghi,
-        model=model,
-        seq_len=seq_len,
-        horizon=horizon,
-        epochs=epochs,
-        batch_size=batch_size,
-        lr=lr
-    )
+    """Forecast future GHI recursively with the Informer-style model."""
+    history, future = _forecast_window(datetime, ghi, horizon, forecast_duration, as_of)
+    model = InformerModel(in_dim=1, d_model=d_model, nhead=nhead, num_layers=num_layers, max_len=seq_len)
+    return _forecast_deep_learning(history, future, model, seq_len, epochs, batch_size, lr)

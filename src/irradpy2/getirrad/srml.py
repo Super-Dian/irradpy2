@@ -39,8 +39,8 @@ STATION_MAP: Dict[str, str] = {
     "STW": "ST",
 }
 
-# All SRML sites use the same local timezone.
-SRML_TZ = "America/Los_Angeles"
+# SRML archive timestamps use Pacific Standard Time year-round.
+SRML_TZ = "Etc/GMT+8"
 
 # Regular SRML variable prefix mapping.
 # For most SRML variables, the first three digits indicate data type,
@@ -75,6 +75,9 @@ VARIABLE_MAP = {
     "956": "albedo",
     "965": "days_since_last_snowfall",
 }
+
+# The archive reports total rainfall in inches and snow depth in centimeters.
+_MM_PER_NATIVE_UNIT = {"915": 25.4, "955": 10.0}
 
 # Exact SRML variable mapping.
 # 7xxx spectral data use all four digits as the data type.
@@ -191,28 +194,21 @@ def _parse_srml_text_to_df(text: str) -> pd.DataFrame:
 
             if flag == 99:
                 val = -999.99
+            elif val >= 0 and codes[j][:3] in _MM_PER_NATIVE_UNIT:
+                val *= _MM_PER_NATIVE_UNIT[codes[j][:3]]
 
             data[name].append(val)
 
-    # Shift time labels back by one interval.
-    if len(raw_list) > 1:
-        interval = raw_list[1] - raw_list[0]
-    else:
-        interval = 100
-
-    adj_times = []
-    for t in raw_list:
-        t_adj = t - interval
-        if interval != 100 and (t_adj % 100) > 60:
-            t_adj -= 40
-        adj_times.append(t_adj)
-
-    timestamps = [
-        f"{year}-{doy:03d}-{hhmm:04d}"
-        for doy, hhmm in zip(doy_list, adj_times)
-    ]
-
-    dt = pd.to_datetime(timestamps, format="%Y-%j-%H%M")
+    # Archive labels mark interval ends in local standard time. Use elapsed
+    # time rather than HHMM arithmetic so gaps and midnight are handled.
+    hhmm = np.asarray(raw_list, dtype=int)
+    dt = (pd.Timestamp(year=year, month=1, day=1)
+          + pd.to_timedelta(np.asarray(doy_list, dtype=int) - 1, unit="D")
+          + pd.to_timedelta(hhmm // 100 * 60 + hhmm % 100, unit="min"))
+    gaps = dt[1:] - dt[:-1]
+    positive_gaps = gaps[gaps > pd.Timedelta(0)]
+    interval = positive_gaps.value_counts().index[0] if positive_gaps.size else pd.Timedelta(hours=1)
+    dt = dt - interval
     df = pd.DataFrame(data, index=dt)
     df.index.name = "datetime"
     return df
@@ -268,6 +264,12 @@ def download_srml(site: str, start: str, end: str, save_path: str):
         End date in ``YYYYMMDD`` format.
     save_path : str
         Absolute output CSV file path.
+
+    Notes
+    -----
+    Precipitation and snow depth are written in millimeters. Station
+    pressure in millibars is numerically equal to hPa. Sky cover retains
+    the archive's scale of tenths.
 
     Returns
     -------

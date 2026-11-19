@@ -1,3 +1,6 @@
+from importlib.resources import files
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -70,7 +73,7 @@ def mrmv6(sza: np.ndarray, datetime, press: np.ndarray, albedo: np.ndarray, aod5
 
     Notes
     -----
-    This model requires the external file 'AEROSOL-TABLE.txt' in the current working directory.
+    A local AEROSOL-TABLE.txt overrides the aerosol table bundled with the package.
     """
 
     sza = np.asarray(sza, dtype=float)
@@ -109,7 +112,10 @@ def mrmv6(sza: np.ndarray, datetime, press: np.ndarray, albedo: np.ndarray, aod5
     Tmg = Tco2 * Tco * Tn2o * Tch4 * To2
 
     # broadband transmission function for aerosol total extinction
-    aerosol_table = np.loadtxt("AEROSOL-TABLE.txt", delimiter=",")
+    local_table = Path("AEROSOL-TABLE.txt")
+    table = local_table if local_table.is_file() else files(__package__).joinpath("AEROSOL-TABLE.txt")
+    with table.open("r", encoding="utf-8") as handle:
+        aerosol_table = np.loadtxt(handle, delimiter=",")
     wavelength = aerosol_table[:, 0]
     ET = aerosol_table[:, 1]
     AODtable = aerosol_table[:, 2:6]

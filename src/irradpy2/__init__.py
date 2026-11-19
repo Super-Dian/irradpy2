@@ -6,4 +6,4 @@ clear-sky modeling, clear-sky detection, separation,
 forecasting, and evaluation.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

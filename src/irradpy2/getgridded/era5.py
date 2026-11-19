@@ -4,7 +4,7 @@ ERA5 downloader for irradpy2.
 Main capabilities
 -----------------
 - Download ERA5 point time-series data and export CSV
-- Download ERA5 area gridded data as monthly GRIB files
+- Download ERA5 gridded data as standardized NetCDF or native GRIB
 - Keep UTC output style simple and consistent with irradpy2
 - Use unified output names consistent with MERRA-2 when possible
 
@@ -20,13 +20,15 @@ import calendar
 import json
 import shutil
 import zipfile
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cdsapi
 import pandas as pd
-
+import xarray as xr
 
 CDS_API_URL = "https://cds.climate.copernicus.eu/api"
 
@@ -45,6 +47,7 @@ DEFAULT_AREA_VARIABLES = ["ssrd", "strd", "t2m", "sp", "tcc"]
 
 INPUT_VARIABLE_MAP: Dict[str, str] = {
     "ghi": "surface_solar_radiation_downwards",
+    "bhi": "total_sky_direct_solar_radiation_at_surface",
     "longwave_down": "surface_thermal_radiation_downwards",
     "temp_air": "2m_temperature",
     "temp_dew": "2m_dewpoint_temperature",
@@ -63,6 +66,7 @@ INPUT_VARIABLE_MAP: Dict[str, str] = {
     "wind_gust_10m": "10m_wind_gust_since_previous_post_processing",
 
     "ssrd": "surface_solar_radiation_downwards",
+    "fdir": "total_sky_direct_solar_radiation_at_surface",
     "strd": "surface_thermal_radiation_downwards",
     "t2m": "2m_temperature",
     "d2m": "2m_dewpoint_temperature",
@@ -86,6 +90,7 @@ OUTPUT_VARIABLE_MAP: Dict[str, str] = {
     "time": "UTC_time",
 
     "surface_solar_radiation_downwards": "ghi",
+    "total_sky_direct_solar_radiation_at_surface": "bhi",
     "surface_thermal_radiation_downwards": "longwave_down",
     "2m_temperature": "temp_air",
     "2m_dewpoint_temperature": "temp_dew",
@@ -104,6 +109,7 @@ OUTPUT_VARIABLE_MAP: Dict[str, str] = {
     "10m_wind_gust_since_previous_post_processing": "wind_gust_10m",
 
     "ssrd": "ghi",
+    "fdir": "bhi",
     "strd": "longwave_down",
     "t2m": "temp_air",
     "d2m": "temp_dew",
@@ -127,30 +133,44 @@ def _k_to_c(value: pd.Series) -> pd.Series:
     return value - 273.15
 
 
-def _j_to_w(value: pd.Series) -> pd.Series:
-    return value / 3600.0
+POINT_ACCUMULATION_SECONDS = 3600  # ERA5 hourly reanalysis interval ending at valid_time.
+POINT_RADIATION = {"ghi", "bhi", "longwave_down"}
+
+
+def _hourly_j_to_w(value: pd.Series) -> pd.Series:
+    return value / POINT_ACCUMULATION_SECONDS
 
 
 def _m_to_mm(value: pd.Series) -> pd.Series:
     return value * 1000.0
 
 
+def _pa_to_hpa(value: pd.Series) -> pd.Series:
+    return value / 100.0
+
+
 UNIT_CONVERTERS: Dict[str, Any] = {
-    "ssrd": _j_to_w,
-    "strd": _j_to_w,
+    "ssrd": _hourly_j_to_w,
+    "fdir": _hourly_j_to_w,
+    "strd": _hourly_j_to_w,
     "t2m": _k_to_c,
     "d2m": _k_to_c,
     "tp": _m_to_mm,
     "sst": _k_to_c,
     "skt": _k_to_c,
+    "sp": _pa_to_hpa,
+    "msl": _pa_to_hpa,
 
-    "surface_solar_radiation_downwards": _j_to_w,
-    "surface_thermal_radiation_downwards": _j_to_w,
+    "surface_solar_radiation_downwards": _hourly_j_to_w,
+    "total_sky_direct_solar_radiation_at_surface": _hourly_j_to_w,
+    "surface_thermal_radiation_downwards": _hourly_j_to_w,
     "2m_temperature": _k_to_c,
     "2m_dewpoint_temperature": _k_to_c,
     "total_precipitation": _m_to_mm,
     "sea_surface_temperature": _k_to_c,
     "skin_temperature": _k_to_c,
+    "surface_pressure": _pa_to_hpa,
+    "mean_sea_level_pressure": _pa_to_hpa,
 }
 
 
@@ -171,11 +191,63 @@ class AreaResult:
     grib_paths: List[Path]
     metadata: Dict[str, Any]
     metadata_path: Path
+    netcdf_paths: List[Path] = field(default_factory=list)
+
+    @property
+    def output_paths(self) -> List[Path]:
+        return self.netcdf_paths or self.grib_paths
 
 
 # -----------------------------------------------------------------------------
 # Utility functions
 # -----------------------------------------------------------------------------
+
+def _netcdf_unit_key(unit):
+    return (str(unit or "").lower().replace(" ", "").replace("**", "").replace("^", "")
+            .replace("⁻²", "-2").replace("⁻¹", "-1").replace("²", "2").replace("−", "-"))
+
+
+def _write_netcdf(dataset, path):
+    encoding = {
+        name: {"zlib": True, "complevel": 2}
+        for name, value in dataset.data_vars.items()
+        if value.ndim and value.dtype.kind in "biuf"
+    }
+    dataset.to_netcdf(path, engine="netcdf4", encoding=encoding)
+
+
+def _transform_netcdf_download(source, target, transform):
+    """Convert a NetCDF response or a ZIP of NetCDF groups before publishing it."""
+    target = Path(target)
+    with TemporaryDirectory(dir=target.parent) as folder:
+        work = Path(folder)
+        paths = [source]
+        if zipfile.is_zipfile(source):
+            with zipfile.ZipFile(source) as archive:
+                paths = []
+                for index, member in enumerate(archive.infolist()):
+                    if member.is_dir() or Path(member.filename).suffix.lower() not in {".nc", ".netcdf", ".nc4"}:
+                        continue
+                    path = work / f"source-{index}.nc"
+                    with archive.open(member) as incoming, path.open("wb") as outgoing:
+                        shutil.copyfileobj(incoming, outgoing)
+                    paths.append(path)
+            if not paths:
+                raise ValueError("The download archive did not contain any NetCDF files.")
+
+        with ExitStack() as stack:
+            datasets = [
+                stack.enter_context(xr.open_dataset(path, engine="netcdf4", chunks="auto"))
+                for path in paths
+            ]
+            dataset, units = transform(datasets)
+            staged = work / "output.nc"
+            _write_netcdf(dataset, staged)
+        staged.replace(target)
+    if Path(source) != target:
+        Path(source).unlink()
+    return units
+
 
 def _to_utc_naive_timestamp(dt: Any) -> pd.Timestamp:
     ts = pd.Timestamp(dt)
@@ -200,7 +272,7 @@ def _normalize_variables(variables: Optional[Sequence[str]], default_variables: 
     return normalized
 
 
-def _build_client(api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = True) -> cdsapi.Client:
+def _build_client(api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = False) -> cdsapi.Client:
     kwargs: Dict[str, Any] = {"quiet": quiet}
 
     if api_key is not None and api_url is None:
@@ -288,33 +360,7 @@ def _default_area_prefix(lat_1: float, lon_1: float, lat_2: float, lon_2: float)
 # -----------------------------------------------------------------------------
 
 def read_era5_point_csv(csv_path: str | Path, map_variables: bool = True, convert_units: bool = True) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Parse an ERA5 point CSV file into a time-indexed DataFrame.
-
-    Parameters
-    ----------
-    csv_path : str or pathlib.Path
-        Path to the raw CDS CSV export.
-    map_variables : bool, default True
-        Rename columns to standard names (``ghi``, ``longwave_down``,
-        ``temp_air``, ``pressure``, ...) via ``OUTPUT_VARIABLE_MAP``.
-    convert_units : bool, default True
-        Apply unit conversions (e.g. K -> degC, m -> mm).
-
-    Returns
-    -------
-    data : pandas.DataFrame
-        Table indexed by UTC timestamps from the ``valid_time``/``time``
-        column (latitude/longitude columns dropped).
-    metadata : dict
-        ``source_file``, ``row_count``, coordinates when present, and the
-        time coverage.
-
-    Raises
-    ------
-    ValueError
-        When no ``valid_time`` or ``time`` column is found.
-    """
+    """Read native hourly ERA5 point CSV, with converted pressure in hPa."""
     csv_path = Path(csv_path)
     df = pd.read_csv(csv_path)
 
@@ -346,11 +392,35 @@ def read_era5_point_csv(csv_path: str | Path, map_variables: bool = True, conver
         for column in df.columns:
             converter = UNIT_CONVERTERS.get(column)
             if converter is not None:
-                df[column] = converter(df[column])
+                df[column] = converter(pd.to_numeric(df[column], errors="coerce"))
+
+    units = {}
+    for column in df.columns:
+        name = OUTPUT_VARIABLE_MAP.get(column, column)
+        output_column = name if map_variables else column
+        if name in POINT_RADIATION:
+            units[output_column] = "W/m2" if convert_units else "J/m2"
+        elif name in {"pressure", "mean_sea_level_pressure"}:
+            units[output_column] = "hPa" if convert_units else "Pa"
+        elif name in {"temp_air", "temp_dew", "sea_surface_temperature", "skin_temperature"}:
+            units[output_column] = "degC" if convert_units else "K"
+        elif name == "precipitation":
+            units[output_column] = "mm" if convert_units else "m"
 
     if map_variables:
         df = df.rename(columns=OUTPUT_VARIABLE_MAP)
+        if not df.columns.is_unique:
+            raise ValueError("ERA5 CSV contains duplicate output variable names.")
+        if convert_units and {"ghi", "bhi"} <= set(df.columns):
+            df["dhi"] = (df["ghi"] - df["bhi"]).clip(lower=0)
+            units["dhi"] = "W/m2"
 
+    metadata.update({
+        "units": units,
+        "timestamp_label": "interval_end",
+        "integration_seconds": POINT_ACCUMULATION_SECONDS,
+        "output_representation": "parsed_csv",
+    })
     if not df.empty:
         metadata["start_utc"] = df.index.min().strftime("%Y-%m-%d %H:%M:%S")
         metadata["end_utc"] = df.index.max().strftime("%Y-%m-%d %H:%M:%S")
@@ -362,49 +432,19 @@ def read_era5_point_csv(csv_path: str | Path, map_variables: bool = True, conver
 # Downloaders
 # -----------------------------------------------------------------------------
 
-def download_era5_point(lat: float, lon: float, start: Any, end: Any, variables: Optional[Sequence[str]] = None, save_path: Optional[str | Path] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = True, map_variables: bool = True, convert_units: bool = True) -> PointResult:
-    """
-    Download ERA5 reanalysis for one point from the CDS API and write it to CSV.
-
-    Parameters
-    ----------
-    lat : float
-        Latitude [degrees].
-    lon : float
-        Longitude [degrees].
-    start : Any
-        Start of the period; anything `pandas.Timestamp` accepts, converted to UTC (tz-aware values are converted, naive values are taken as-is).
-    end : Any
-        End of the period (same parsing as `start`); must not precede `start` (`ValueError`).
-    variables : sequence of str, optional
-        CDS variable names or local aliases (`ghi`, `temp_air`, ... resolved via `INPUT_VARIABLE_MAP`); defaults to `["ssrd", "strd", "t2m", "sp", "tcc", "tp"]`.
-    save_path : str or pathlib.Path, optional
-        Output CSV path; defaults to `era5_<lat>_<lon>_<start>_<end>.csv`. The `.csv` suffix is forced.
-    api_url : str, optional
-        CDS API endpoint override.
-    api_key : str, optional
-        CDS API key override.
-    quiet : bool, default True
-        Suppress `cdsapi` client progress output.
-    map_variables : bool, default True
-        Rename columns to standard names (`ghi`, `longwave_down`, `temp_air`, `pressure`, `cloud_fraction`, `precipitation`, ...).
-    convert_units : bool, default True
-        Apply unit conversions (e.g. K -> degC, m -> mm).
-
-    Returns
-    -------
-    PointResult dataclass — `data` (pandas.DataFrame with a `UTC_time` column plus the requested variables), `metadata` (dict: request, columns, coverage), `csv_path`, `metadata_path` (pathlib.Path). The CSV and a `<stem>_metadata.json` sidecar are written to disk.
-
-    Notes
-    -----
-    Issues one CDS retrieve covering the whole range, then parses and rewrites the CSV. Uses the CDS `cdsapi` client: passing only `api_key` targets the public endpoint (CDS for ERA5, ADS for CAMS); otherwise settings come from `~/.cdsapirc`, with `api_url`/`api_key` overriding individual values.
-    """
+def download_era5_point(lat: float, lon: float, start: Any, end: Any, variables: Optional[Sequence[str]] = None, save_path: Optional[str | Path] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = False, map_variables: bool = True, convert_units: bool = True) -> PointResult:
     start_ts = _to_utc_naive_timestamp(start)
     end_ts = _to_utc_naive_timestamp(end)
 
     if end_ts < start_ts:
         raise ValueError("end must be later than or equal to start.")
 
+    if variables is not None and "dni" in variables:
+        raise ValueError("ERA5 fdir is direct horizontal radiation (bhi). Use CAMS for directly supplied dni.")
+    if variables is not None and "dhi" in variables:
+        if not (map_variables and convert_units):
+            raise ValueError("Derived ERA5 dhi requires map_variables=True and convert_units=True.")
+        variables = [name for name in variables if name != "dhi"] + ["ghi", "bhi"]
     normalized_variables = _normalize_variables(variables=variables, default_variables=DEFAULT_POINT_VARIABLES)
 
     if save_path is None:
@@ -433,7 +473,7 @@ def download_era5_point(lat: float, lon: float, start: Any, end: Any, variables:
     export_df.insert(0, "UTC_time", export_df.index.strftime("%Y-%m-%d %H:%M:%S"))
     export_df = export_df.reset_index(drop=True)
 
-    ordered_cols = ["ghi", "longwave_down", "temp_air", "pressure", "cloud_fraction", "precipitation"]
+    ordered_cols = ["ghi", "bhi", "dhi", "longwave_down", "temp_air", "pressure", "cloud_fraction", "precipitation"]
     existing_cols = [col for col in ordered_cols if col in export_df.columns]
     other_cols = [col for col in export_df.columns if col not in existing_cols and col != "UTC_time"]
     export_df = export_df[["UTC_time"] + existing_cols + other_cols]
@@ -449,45 +489,43 @@ def download_era5_point(lat: float, lon: float, start: Any, end: Any, variables:
     return PointResult(data=export_df, metadata=metadata, csv_path=save_path, metadata_path=metadata_path)
 
 
-def download_era5_area(lat_1: float, lon_1: float, lat_2: float, lon_2: float, start: Any, end: Any, variables: Optional[Sequence[str]] = None, output_dir: str | Path = "ERA5_data", file_prefix: Optional[str] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = True) -> AreaResult:
-    """
-    Download ERA5 reanalysis for a bounding box from the CDS API as monthly GRIB files.
+def _standardize_area(datasets, map_variables, derive_dhi):
+    ds = xr.merge(datasets, compat="no_conflicts", combine_attrs="drop_conflicts")
+    conversions = {
+        **dict.fromkeys(POINT_RADIATION, ({"jm-2", "j/m2"}, {"wm-2", "w/m2"}, "W/m2")),
+        **dict.fromkeys(("pressure", "mean_sea_level_pressure"), ({"pa", "pascal", "pascals"}, {"hpa", "mbar"}, "hPa")),
+        **dict.fromkeys(("temp_air", "temp_dew", "sea_surface_temperature", "skin_temperature"), ({"k", "kelvin"}, {"degc", "°c", "celsius"}, "degC")),
+        "precipitation": ({"m", "mofwaterequivalent"}, {"mm"}, "mm"),
+    }
+    for original in list(ds.data_vars):
+        name = OUTPUT_VARIABLE_MAP.get(original, original)
+        if name not in conversions:
+            continue
+        native, converted, target = conversions[name]
+        original_data = ds[original]
+        unit = _netcdf_unit_key(original_data.attrs.get("units"))
+        if unit in native:
+            convert = UNIT_CONVERTERS.get(original) or UNIT_CONVERTERS[INPUT_VARIABLE_MAP[name]]
+            ds[original] = convert(original_data).assign_attrs(original_data.attrs)
+        elif unit not in converted:
+            raise ValueError(f"Unexpected ERA5 unit for {original}: {original_data.attrs.get('units')!r}")
+        ds[original].attrs["units"] = target
+        for attribute in ("GRIB_units", "GRIB_stepType"):
+            ds[original].attrs.pop(attribute, None)
+        if name in POINT_RADIATION and unit in native:
+            for attribute in ("standard_name", "long_name"):
+                ds[original].attrs.pop(attribute, None)
+            ds[original].attrs.update(cell_methods="time: mean (interval: 1 hour)", timestamp_label="interval_end")
 
-    Parameters
-    ----------
-    lat_1 : float
-        First corner latitude [degrees].
-    lon_1 : float
-        First corner longitude [degrees].
-    lat_2 : float
-        Opposite corner latitude [degrees]; must differ from `lat_1` (`ValueError`), order versus `lat_1` is irrelevant (sorted internally).
-    lon_2 : float
-        Opposite corner longitude [degrees]; must differ from `lon_1` (`ValueError`).
-    start : Any
-        Start of the period; anything `pandas.Timestamp` accepts, converted to UTC (tz-aware values are converted, naive values are taken as-is).
-    end : Any
-        End of the period (same parsing as `start`); must not precede `start` (`ValueError`).
-    variables : sequence of str, optional
-        CDS variable names or local aliases; defaults to `["ssrd", "strd", "t2m", "sp", "tcc"]`.
-    output_dir : str or pathlib.Path, default "ERA5_data"
-        Directory for GRIB parts and metadata (created if missing).
-    file_prefix : str, optional
-        Output file prefix; defaults to `era5_area_<lat_1>_<lon_1>_<lat_2>_<lon_2>`.
-    api_url : str, optional
-        CDS API endpoint override.
-    api_key : str, optional
-        CDS API key override.
-    quiet : bool, default True
-        Suppress `cdsapi` client progress output.
+    if map_variables:
+        ds = ds.rename({name: OUTPUT_VARIABLE_MAP[name] for name in ds.data_vars if name in OUTPUT_VARIABLE_MAP})
+        if "ghi" in ds and "bhi" in ds and (derive_dhi or "dhi" not in ds):
+            ds["dhi"] = (ds["ghi"] - ds["bhi"]).clip(min=0).assign_attrs(units="W/m2", cell_methods="time: mean (interval: 1 hour)")
+    return ds, {name: value.attrs["units"] for name, value in ds.data_vars.items() if "units" in value.attrs}
 
-    Returns
-    -------
-    AreaResult dataclass — `grib_paths` (list of pathlib.Path, one GRIB part per month), `metadata` (dict), `metadata_path`. A `<prefix>_metadata.json` sidecar is written.
 
-    Notes
-    -----
-    The range is split into month chunks, each retrieved as its own GRIB file. Uses the CDS `cdsapi` client: passing only `api_key` targets the public endpoint (CDS for ERA5, ADS for CAMS); otherwise settings come from `~/.cdsapirc`, with `api_url`/`api_key` overriding individual values.
-    """
+def download_era5_area(lat_1: float, lon_1: float, lat_2: float, lon_2: float, start: Any, end: Any, variables: Optional[Sequence[str]] = None, output_dir: str | Path = "ERA5_data", file_prefix: Optional[str] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = True, *, convert_units: bool = True, map_variables: bool = True) -> AreaResult:
+    """Download standardized NetCDF, or provider GRIB with convert_units=False."""
     start_ts = _to_utc_naive_timestamp(start)
     end_ts = _to_utc_naive_timestamp(end)
 
@@ -503,6 +541,13 @@ def download_era5_area(lat_1: float, lon_1: float, lat_2: float, lon_2: float, s
     west = min(float(lon_1), float(lon_2))
     east = max(float(lon_1), float(lon_2))
 
+    derive_dhi = variables is not None and "dhi" in variables
+    if variables is not None and "dni" in variables:
+        raise ValueError("ERA5 provides direct horizontal radiation (bhi), not dni.")
+    if derive_dhi:
+        if not (convert_units and map_variables):
+            raise ValueError("Derived ERA5 dhi requires convert_units=True and map_variables=True.")
+        variables = [name for name in variables if name != "dhi"] + ["ghi", "bhi"]
     normalized_variables = _normalize_variables(variables=variables, default_variables=DEFAULT_AREA_VARIABLES)
 
     output_dir = Path(output_dir)
@@ -516,31 +561,48 @@ def download_era5_area(lat_1: float, lon_1: float, lat_2: float, lon_2: float, s
 
     chunk_infos: List[Dict[str, Any]] = []
     grib_paths: List[Path] = []
+    netcdf_paths: List[Path] = []
+    units: Dict[str, str] = {}
+    data_format = "netcdf" if convert_units else "grib"
+    suffix = ".nc" if convert_units else ".grib"
 
-    for chunk_start, chunk_end in _month_chunks(start_ts, end_ts):
+    for chunk_start, chunk_end in _month_chunks(start_ts.normalize(), end_ts.normalize()):
         year_str = f"{chunk_start.year:04d}"
         month_str = f"{chunk_start.month:02d}"
         days = [f"{day:02d}" for day in range(chunk_start.day, chunk_end.day + 1)]
 
-        request = {"product_type": "reanalysis", "variable": normalized_variables, "year": [year_str], "month": [month_str], "day": days, "time": ERA5_HOURS, "area": [north, west, south, east], "data_format": "grib"}
+        request = {"product_type": "reanalysis", "variable": normalized_variables, "year": [year_str], "month": [month_str], "day": days, "time": ERA5_HOURS, "area": [north, west, south, east], "data_format": data_format}
 
-        part_name = f"{file_prefix}_{year_str}{month_str}.grib"
+        part_name = f"{file_prefix}_{year_str}{month_str}{suffix}"
         part_path = output_dir / part_name
         raw_download = output_dir / f"{file_prefix}_{year_str}{month_str}__raw.download"
 
         client.retrieve(AREA_DATASET, request, str(raw_download))
-        _extract_or_move_single_file(raw_path=raw_download, final_path=part_path, allowed_suffixes={".grib", ".grb"})
-
-        grib_paths.append(part_path)
-        chunk_infos.append({"chunk_start": chunk_start.strftime("%Y-%m-%d"), "chunk_end": chunk_end.strftime("%Y-%m-%d"), "grib_path": str(part_path), "request": request})
+        if convert_units:
+            units.update(_transform_netcdf_download(raw_download, part_path, lambda files: _standardize_area(files, map_variables, derive_dhi)))
+            netcdf_paths.append(part_path)
+        else:
+            _extract_or_move_single_file(raw_path=raw_download, final_path=part_path, allowed_suffixes={".grib", ".grb"})
+            grib_paths.append(part_path)
+        path_key = "netcdf_path" if convert_units else "grib_path"
+        chunk_infos.append({"chunk_start": chunk_start.strftime("%Y-%m-%d"), "chunk_end": chunk_end.strftime("%Y-%m-%d"), path_key: str(part_path), "request": request})
 
     mapped_variables = [OUTPUT_VARIABLE_MAP.get(var, var) for var in normalized_variables]
+    if "dhi" in units:
+        mapped_variables.append("dhi")
 
     metadata: Dict[str, Any] = {"mode": "area", "dataset": AREA_DATASET, "lat_1": lat_1, "lon_1": lon_1, "lat_2": lat_2, "lon_2": lon_2, "north": north, "south": south, "west": west, "east": east, "start_utc": start_ts.strftime("%Y-%m-%d %H:%M:%S"), "end_utc": end_ts.strftime("%Y-%m-%d %H:%M:%S"), "variables": normalized_variables, "mapped_variables": mapped_variables, "file_prefix": file_prefix, "grib_count": len(grib_paths), "grib_paths": [str(path) for path in grib_paths], "chunks": chunk_infos}
 
+    metadata.update({
+        "output_representation": "standardized_netcdf" if convert_units else "provider_native",
+        "netcdf_paths": [str(path) for path in netcdf_paths],
+        "netcdf_count": len(netcdf_paths),
+        "units": units,
+        "radiation_timing": {"timestamp_label": "interval_end", "integration_seconds": 3600},
+    })
     _write_json(metadata, metadata_path)
 
-    return AreaResult(grib_paths=grib_paths, metadata=metadata, metadata_path=metadata_path)
+    return AreaResult(grib_paths=grib_paths, metadata=metadata, metadata_path=metadata_path, netcdf_paths=netcdf_paths)
 
 
 # -----------------------------------------------------------------------------
@@ -548,36 +610,6 @@ def download_era5_area(lat_1: float, lon_1: float, lat_2: float, lon_2: float, s
 # -----------------------------------------------------------------------------
 
 def download_era5(mode: str = "point", start: Any = None, end: Any = None, variables: Optional[Sequence[str]] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = True, **kwargs: Any) -> PointResult | AreaResult:
-    """
-    Unified ERA5 entry point; dispatches to the point or area downloader by `mode`.
-
-    Parameters
-    ----------
-    mode : str, default "point"
-        `"point"` or `"area"` (case-insensitive; `ValueError` otherwise).
-    start : Any
-        Start of the period; required (`ValueError` when `None`).
-    end : Any
-        End of the period; required.
-    variables : sequence of str, optional
-        Forwarded to the chosen downloader.
-    api_url : str, optional
-        CDS API endpoint override.
-    api_key : str, optional
-        CDS API key override.
-    quiet : bool, default True
-        Suppress `cdsapi` client progress output.
-    **kwargs : keyword arguments
-        `mode="point"` requires `lat`, `lon` (optional `save_path`, `map_variables`, `convert_units`); `mode="area"` requires `lat_1`, `lon_1`, `lat_2`, `lon_2` (optional `output_dir`, `file_prefix`). Missing required keys raise `ValueError`.
-
-    Returns
-    -------
-    PointResult or AreaResult — whichever dataclass the selected downloader returns.
-
-    Notes
-    -----
-    Uses the CDS `cdsapi` client: passing only `api_key` targets the public endpoint (CDS for ERA5, ADS for CAMS); otherwise settings come from `~/.cdsapirc`, with `api_url`/`api_key` overriding individual values.
-    """
     mode = mode.lower().strip()
 
     if start is None or end is None:
@@ -595,7 +627,7 @@ def download_era5(mode: str = "point", start: Any = None, end: Any = None, varia
             if key not in kwargs:
                 raise ValueError(f"mode='area' requires keyword argument: {key}")
 
-        return download_era5_area(lat_1=kwargs["lat_1"], lon_1=kwargs["lon_1"], lat_2=kwargs["lat_2"], lon_2=kwargs["lon_2"], start=start, end=end, variables=variables, output_dir=kwargs.get("output_dir", "ERA5_data"), file_prefix=kwargs.get("file_prefix"), api_url=api_url, api_key=api_key, quiet=quiet)
+        return download_era5_area(lat_1=kwargs["lat_1"], lon_1=kwargs["lon_1"], lat_2=kwargs["lat_2"], lon_2=kwargs["lon_2"], start=start, end=end, variables=variables, output_dir=kwargs.get("output_dir", "ERA5_data"), file_prefix=kwargs.get("file_prefix"), api_url=api_url, api_key=api_key, quiet=quiet, convert_units=kwargs.get("convert_units", True), map_variables=kwargs.get("map_variables", True))
 
     raise ValueError("mode must be either 'point' or 'area'.")
 

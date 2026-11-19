@@ -109,10 +109,13 @@ def _parse_data_block(lines: List[str], tz_hours: int) -> pd.DataFrame:
     for key, (val_i, qc_i) in FIELD_MAP.items():
         raw = df[f"c{val_i}"]
         qc = df[f"c{qc_i}"]
+        if key == "uvb":
+            raw = raw.where(raw <= -999.9, raw / 1000.0)
         df[key] = raw.where((qc == 0) & (raw > -9000), -999.9)
 
     for key, idx in STD_FIELDS.items():
-        df[key] = df[f"c{idx}"].astype(float)
+        raw = df[f"c{idx}"].astype(float)
+        df[key] = raw.where(raw < 0, raw / 1000.0) if key == "std_uvb" else raw
 
     df = attach_local_and_offset(df, local_ts=local_dt.dt.tz_localize(f"Etc/GMT{(-tz_hours):+d}"), local_col="Local_Time", offset_col="UTC_Offset")
     df = df.sort_values("UTC_Time")
@@ -147,6 +150,10 @@ def download_solrad(site: str, start: str, end: str, save_path: str) -> None:
         End date in ``YYYY-MM-DD`` or ``YYYYMMDD`` format.
     save_path : str
         Absolute output CSV file path.
+
+    Notes
+    -----
+    UVB irradiance and its standard deviation are converted from mW/m² to W/m².
 
     Returns
     -------

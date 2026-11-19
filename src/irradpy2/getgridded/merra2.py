@@ -17,11 +17,11 @@ post-processing should be placed in separate modules.
 import datetime
 import _thread
 import errno
+import json
 import logging
 import multiprocessing
 import os
 import re
-import ssl
 import threading
 import time
 import urllib.error
@@ -37,6 +37,8 @@ import pandas as pd
 import requests
 import xarray as xr
 
+from .era5 import _transform_netcdf_download, _netcdf_unit_key
+
 try:
     import earthaccess
     from pydap.client import get_cmr_urls
@@ -45,9 +47,6 @@ except ImportError:
     earthaccess = None
     get_cmr_urls = None
     create_session = None
-
-ssl._create_default_https_context = ssl._create_unverified_context
-
 
 # =============================================================================
 # Variable registry
@@ -219,8 +218,8 @@ VARIABLE_MAP = {
     "SWGDNCLR": "ghi_clear",
     "ALBEDO": "albedo",
     "LWGNT": "longwave_net",
-    "LWGEM": "longwave_up",
-    "LWGAB": "longwave_down",
+    "LWGEM": "longwave_emitted",
+    "LWGAB": "longwave_absorbed",
     "CLDTOT": "cloud_fraction",
     "TAUTOT": "cloud_optical_thickness",
     "T2M": "temp_air",
@@ -230,22 +229,41 @@ VARIABLE_MAP = {
     "TQV": "water_vapour",
     "TO3": "ozone",
     "PS": "pressure",
+    "RH": "relative_humidity",
     "QV2M": "specific_humidity",
     "TOTSCATAU": "aod_scattering",
     "TOTEXTTAU": "aod550",
     "TOTANGSTR": "angstrom_exponent",
-    "EVAP": "evaporation",
-    "PRECTOT": "precipitation",
-    "PRECCON": "convective_precipitation",
-    "PRECTOTCORR": "precipitation_corrected",
-    "TPRECMAX": "precipitation_max",
-    "PRECSNO": "snowfall",
+    "EVAP": "evaporation_rate",
+    "PRECTOT": "precipitation_rate",
+    "PRECCON": "convective_precipitation_rate",
+    "PRECTOTCORR": "precipitation_corrected_rate",
+    "TPRECMAX": "precipitation_max_rate",
+    "PRECSNO": "snowfall_rate",
     "U10M": "wind_u_10m",
     "V10M": "wind_v_10m",
     "FRSEAICE": "sea_ice_fraction",
     "PHIS": "surface_geopotential",
 }
 
+
+POINT_TEMPERATURE_COLUMNS = ("temp_air", "temp_dew", "temp_air_max", "temp_air_min")
+_POINT_WATER_FLUX_COLUMNS = (
+    "evaporation_rate", "precipitation_rate", "convective_precipitation_rate",
+    "precipitation_corrected_rate", "precipitation_max_rate", "snowfall_rate",
+)
+_UNIT_CONVERSIONS = {
+    **dict.fromkeys(POINT_TEMPERATURE_COLUMNS, ({"k", "kelvin"}, {"degc", "°c", "celsius"}, "degC", 1.0, -273.15)),
+    "pressure": ({"pa", "pascal", "pascals"}, {"hpa", "mb", "mbar", "millibar", "millibars"}, "hPa", 0.01, 0.0),
+    "relative_humidity": ({"1", "fraction", "dimensionless", "unitless", "0-1"}, {"%", "percent"}, "%", 100.0, 0.0),
+    **dict.fromkeys(_POINT_WATER_FLUX_COLUMNS, ({"kgm-2s-1", "kg/m2/s"}, {"mm/h", "mmh-1"}, "mm/h", 3600.0, 0.0)),
+}
+
+# The radiation product supplies an hourly mean labeled at the interval center.
+POINT_RADIATION_TIMING = {
+    "timestamp_label": "interval_center",
+    "integration_seconds": 3600,
+}
 
 POINT_UNSUPPORTED_COLLECTIONS = {"asm", "phis", "sftgif", "sftkf", "sftlf", "sftof", "shg", "hur"}
 
@@ -255,14 +273,7 @@ POINT_UNSUPPORTED_COLLECTIONS = {"asm", "phis", "sftgif", "sftkf", "sftlf", "sft
 # =============================================================================
 
 def list_merra2_collections():
-    """Return a copy of the built-in MERRA2 collection registry.
-
-    Returns
-    -------
-    dict
-        A copy of ``{collection_name: {...}}``; mutating it does not affect
-        the module-level table.
-    """
+    """Return a copy of the built-in MERRA2 collection registry."""
     return {k: dict(v) for k, v in var_list.items()}
 
 
@@ -392,6 +403,52 @@ def _safe_decode_response(response):
         return response.text
 
 
+def _normalize_units(name, units):
+    native, converted, target, factor, offset = _UNIT_CONVERSIONS[name]
+    token = _netcdf_unit_key(units)
+    if token in converted:
+        return target, 1.0, 0.0
+    if not token or token in native:
+        return target, factor, offset
+    raise ValueError(f"Unexpected MERRA-2 unit for {name}: {units!r}.")
+
+
+def _standardize_area(datasets, map_variables):
+    ds = datasets[0]
+    names = {}
+    for original, data in ds.data_vars.items():
+        name = VARIABLE_MAP.get(original, original)
+        missing = data.attrs.get("fmissing_value")
+        if missing is not None:
+            for sentinel in np.asarray(missing).reshape(-1):
+                data = data.where(data != sentinel)
+            data.attrs.pop("fmissing_value", None)
+            ds[original] = data
+        if name in _UNIT_CONVERSIONS:
+            target, factor, offset = _normalize_units(name, data.attrs.get("units"))
+            if factor != 1.0 or offset:
+                ds[original] = (data * factor + offset).assign_attrs(data.attrs)
+                ds[original].attrs.pop("valid_min", None)
+                ds[original].attrs.pop("valid_max", None)
+                ds[original].attrs.pop("valid_range", None)
+            ds[original].attrs["units"] = target
+        if name in {"ghi", "ghi_clear", "longwave_net", "longwave_emitted", "longwave_absorbed"}:
+            if _netcdf_unit_key(data.attrs.get("units")) in {"wm-2", "w/m2"}:
+                ds[original].attrs["units"] = "W/m2"
+            ds[original].attrs.update(POINT_RADIATION_TIMING)
+        elif name == "relative_humidity":
+            ds[original].attrs.update(timestamp_label="interval_center", integration_seconds=10800)
+        if map_variables and name != original:
+            names[original] = name
+    if map_variables and "precipitation_rate" in ds and "precipitation" not in ds:
+        ds["precipitation"] = ds["precipitation_rate"].assign_attrs(units="mm", long_name="Hourly precipitation amount")
+    elif map_variables and "PRECTOT" in ds and "precipitation" not in ds:
+        ds["precipitation"] = ds["PRECTOT"].assign_attrs(units="mm", long_name="Hourly precipitation amount")
+    ds = ds.rename(names)
+    ds.attrs["irradpy2_units"] = "standardized"
+    return ds, {name: value.attrs["units"] for name, value in ds.data_vars.items() if "units" in value.attrs}
+
+
 def _rename_dataset_with_variable_map(ds):
     rename_dict = {name: VARIABLE_MAP[name] for name in ds.variables if name in VARIABLE_MAP}
     if rename_dict:
@@ -423,35 +480,10 @@ class DownloadManager(object):
 
     @property
     def download_url(self):
-        """
-        Return the configured download URL.
-
-        Returns
-        -------
-        str
-            The download URL, or an empty string when unset.
-        """
         return self.__download_url
 
     @download_url.setter
     def download_url(self, link):
-        """
-        Set the download URL after validating its structure.
-
-        Parameters
-        ----------
-        link : str
-            Download URL; ``None`` is stored as an empty string.
-
-        Returns
-        -------
-        None
-
-        Raises
-        ------
-        ValueError
-            When the URL does not contain a recognisable filename.
-        """
         if link is None:
             self.__download_url = ""
         else:
@@ -463,47 +495,13 @@ class DownloadManager(object):
 
     @property
     def download_path(self):
-        """
-        Return the local download directory.
-
-        Returns
-        -------
-        str
-            Directory that receives downloaded files.
-        """
         return self.__download_path
 
     @download_path.setter
     def download_path(self, file_path):
-        """
-        Set the local download directory.
-
-        Parameters
-        ----------
-        file_path : str
-            Target directory; created on demand by ``start_download``.
-
-        Returns
-        -------
-        None
-        """
         self.__download_path = file_path
 
     def set_username_and_password(self, username, password):
-        """
-        Store Earthdata Login credentials for later downloads.
-
-        Parameters
-        ----------
-        username : str
-            Earthdata Login user name.
-        password : str
-            Earthdata Login password.
-
-        Returns
-        -------
-        None
-        """
         self.__username = username
         self.__password = password
 
@@ -512,22 +510,6 @@ class DownloadManager(object):
         self.__download_and_save_file(url_item, file_path)
 
     def start_download(self, filename=None):
-        """
-        Download ``download_url`` into ``download_path``.
-
-        Creates the target directory and an authenticated session on first use.
-
-        Parameters
-        ----------
-        filename : str, optional
-            Output filename. When ``None``, it is derived from the download URL.
-
-        Returns
-        -------
-        None
-            The file is written to ``download_path``; HTML responses and empty
-            bodies raise ``RuntimeError``.
-        """
         if self._authenticated_session is None:
             self._authenticated_session = self.__create_authenticated_sesseion()
         os.makedirs(self.download_path, exist_ok=True)
@@ -535,24 +517,6 @@ class DownloadManager(object):
 
     @staticmethod
     def get_filename(url):
-        """
-        Extract the file name from a URL.
-
-        Parameters
-        ----------
-        url : str
-            URL whose last path component carries the file name.
-
-        Returns
-        -------
-        str
-            The file name including its extension.
-
-        Raises
-        ------
-        ValueError
-            When no file name can be extracted.
-        """
         reg_exp = r"(\w+)(\.\w+)+(?!.*(\w+)(\.\w+)+)"
         match = re.search(reg_exp, url)
         if match is None:
@@ -601,8 +565,8 @@ class DownloadManager(object):
         cookie_jar = urllib.request.HTTPCookieProcessor(auth_cookie_jar)
         opener = urllib.request.build_opener(auth_handler, cookie_jar)
 
-        urllib.request.install_opener(opener)
-        opener.open(self.download_url)
+        with opener.open(self.download_url, timeout=30):
+            pass
 
         return auth_cookie_jar
 
@@ -622,146 +586,33 @@ class SocketManager:
     def __init__(self):
         self._cloud_manager = None
 
-    def generate_url_params(self, parameter, time_para, lat_para, lon_para):
-        """
-        Build an OPeNDAP constraint expression for the requested variables.
-
-        Parameters
-        ----------
-        parameter : sequence of str
-            Base variable names (``{var}{time}{lat}{lon}`` suffixes are appended).
-        time_para : str
-            Time-dimension index slice, e.g. ``"[0:23]"``.
-        lat_para : str
-            Latitude-dimension index slice.
-        lon_para : str
-            Longitude-dimension index slice.
-
-        Returns
-        -------
-        str
-            Comma-joined variable selections plus the ``time``/``lat``/``lon``
-            dimension selections.
-        """
-        parameter = map(lambda x: x + time_para, parameter)
-        parameter = map(lambda x: x + lat_para, parameter)
-        parameter = map(lambda x: x + lon_para, parameter)
-        addition = ["time", "lat" + lat_para, "lon" + lon_para]
-        return ",".join(parameter) + "," + ",".join(addition)
+    def generate_url_params(self, parameter, time_para, lat_para, lon_para, level_para=""):
+        slices = time_para + level_para + lat_para + lon_para
+        coordinates = ["time" + time_para, "lat" + lat_para, "lon" + lon_para]
+        if level_para:
+            coordinates.append("lev" + level_para)
+        return ",".join([*(name + slices for name in parameter), *coordinates])
 
     def translate_lat_to_geos5_native(self, latitude):
-        """
-        Translate a latitude in degrees to the GEOS-5 native index.
-
-        Parameters
-        ----------
-        latitude : float
-            Latitude in degrees.
-
-        Returns
-        -------
-        float
-            Native grid index ``(latitude + 90) / 0.5``.
-        """
         return ((latitude + 90) / 0.5)
 
     def translate_lon_to_geos5_native(self, longitude):
-        """
-        Translate a longitude in degrees to the GEOS-5 native index.
-
-        Parameters
-        ----------
-        longitude : float
-            Longitude in degrees.
-
-        Returns
-        -------
-        float
-            Native grid index ``(longitude + 180) / 0.625``.
-        """
         return ((longitude + 180) / 0.625)
 
     def find_closest_coordinate(self, calc_coord, coord_array):
-        """
-        Return the grid coordinate nearest to a computed index.
-
-        Parameters
-        ----------
-        calc_coord : float
-            Target coordinate value.
-        coord_array : numpy.ndarray
-            Candidate grid coordinates.
-
-        Returns
-        -------
-        float
-            The candidate closest to ``calc_coord``.
-        """
         index = np.abs(coord_array - calc_coord).argmin()
         return coord_array[index]
 
     def build_remote_url(self, merra2_collection, date):
-        """
-        Build the OPeNDAP directory URL for a collection and date.
-
-        Parameters
-        ----------
-        merra2_collection : dict
-            Collection registry entry (uses ``esdt_dir`` and ``collection``).
-        date : datetime.date
-            Granule date; constant collections use the fixed 1980 monthly path.
-
-        Returns
-        -------
-        str
-            Remote directory URL.
-
-        Notes
-        -----
-        Legacy URL builder; live area downloads use ``_build_cloud_area_url``.
-        """
+        """Legacy URL builder; live downloads use _build_cloud_area_url instead."""
         if merra2_collection["collection"].startswith("const"):
             return ("https://goldsmr4.gesdisc.eosdis.nasa.gov/opendap/MERRA2_MONTHLY/{db_name}/1980/").format(db_name=merra2_collection["esdt_dir"])
         return ("https://goldsmr4.gesdisc.eosdis.nasa.gov/opendap/MERRA2/{db_name}/{date:%Y}/{date:%m}/").format(db_name=merra2_collection["esdt_dir"], date=date)
 
     def reconstruct_filename(self, name, params):
-        """
-        Rebuild the ``name?params`` key used in download logs.
-
-        Parameters
-        ----------
-        name : str
-            File name.
-        params : str or None
-            OPeNDAP constraint expression appended after ``?``.
-
-        Returns
-        -------
-        str
-            ``name?params`` (``name`` alone when ``params`` is None).
-        """
         return "{name}?{params}".format(name=name, params=params)
 
     def build_remote_filename(self, merra2_collection, date, params):
-        """
-        Build the MERRA-2 granule file name (optionally with constraints).
-
-        Parameters
-        ----------
-        merra2_collection : dict
-            Collection registry entry (uses ``collection``).
-        date : datetime.date
-            Granule date; selects the MERRA-2 stream (100/200/300/400) from the
-            year. Constant collections use stream 101, date ``00000000`` and the
-            ``nc4`` extension.
-        params : str or None
-            OPeNDAP constraint expression appended after ``?`` when given.
-
-        Returns
-        -------
-        str
-            File name such as ``MERRA2_400.tavg1_2d_rad_Nx.20250101.nc4.nc``.
-        """
         merra_stream = "400"
         file_extension = "nc"
         date_string = "{date:%Y%m%d}".format(date=date)
@@ -822,28 +673,6 @@ class SocketManager:
         return url
 
     def download_merra2_nc(self, date, merra2_collection, output_directory, params, auth):
-        """
-        Download one daily MERRA-2 granule with a single retry attempt.
-
-        Parameters
-        ----------
-        date : datetime.date
-            Granule date.
-        merra2_collection : dict
-            Collection registry entry.
-        output_directory : str or pathlib.Path
-            Destination directory (existing file for the date is replaced).
-        params : str or None
-            OPeNDAP constraint expression.
-        auth : dict
-            Earthdata credentials ``{"uid": ..., "password": ...}``.
-
-        Returns
-        -------
-        bool
-            True when the download succeeded; False after the failed attempt
-            (``global_retry`` is set unless the cause was authentication).
-        """
         # Preserve the original local filenames used by the merge/resume logic.
         filename = self.build_remote_filename(merra2_collection, date, None)
         file_path = os.path.join(output_directory, filename)
@@ -903,40 +732,12 @@ class SocketManager:
         return True
 
     def iter_days(self, first: datetime.date, last: datetime.date):
-        """
-        Yield every calendar day from ``first`` to ``last`` inclusive.
-
-        Parameters
-        ----------
-        first : datetime.date
-            Inclusive range start.
-        last : datetime.date
-            Inclusive range end.
-
-        Returns
-        -------
-        generator of datetime.date
-        """
         current = first
         while current <= last:
             yield current
             current += datetime.timedelta(1)
 
     def iter_months(self, first: datetime.date, last: datetime.date):
-        """
-        Yield every month from ``first`` to ``last`` as ``YYYY-MM`` strings.
-
-        Parameters
-        ----------
-        first : datetime.date
-            Inclusive range start.
-        last : datetime.date
-            Inclusive range end.
-
-        Returns
-        -------
-        generator of str
-        """
         ym_start = 12 * first.year + first.month - 1
         ym_end = 12 * last.year + last.month - 1
         for ym in range(ym_start, ym_end + 1):
@@ -944,65 +745,10 @@ class SocketManager:
             yield "{:0>4d}-{:0>2d}".format(y, m + 1)
 
     def iter_years(self, first: datetime.date, last: datetime.date):
-        """
-        Yield one item per year from ``first`` to ``last`` inclusive.
-
-        Parameters
-        ----------
-        first : datetime.date
-            Inclusive range start.
-        last : datetime.date
-            Inclusive range end.
-
-        Returns
-        -------
-        generator of str
-            Each item is the unfilled template string ``{:0>4d}``; formatting it
-            with the year is left to the caller.
-        """
         for y in range(first.year, last.year + 1):
             yield "{:0>4d}".format(y)
 
     def subdaily_universal_download(self, merra2_collection: dict, initial_year: int, final_year: int, initial_month: int = 1, final_month: int = 12, initial_day: int = 1, final_day: Optional[int] = None, params: Optional[str] = None, auth: dict = None, output_directory: Union[str, Path] = None, thread_num: int = 5, merge: str = "monthly"):
-        """
-        Download all daily granules of a collection for a date range.
-
-        Skips files already recorded in the ``index.npy`` resume log, verifies
-        existing files by opening them, downloads missing days in batches of
-        ``thread_num`` (process pool when greater than 1) and marks integrity
-        failures on ``global_retry``.
-
-        Parameters
-        ----------
-        merra2_collection : dict
-            Collection registry entry.
-        initial_year : int
-            First year (with ``initial_month``/``initial_day``).
-        final_year : int
-            Last year (with ``final_month``/``final_day``).
-        initial_month : int, default 1
-            First month.
-        final_month : int, default 12
-            Last month.
-        initial_day : int, default 1
-            First day.
-        final_day : int, optional
-            Last day; required to build the end date.
-        params : str or None, optional
-            OPeNDAP constraint expression.
-        auth : dict, optional
-            Earthdata credentials.
-        output_directory : str or pathlib.Path, optional
-            Destination directory (also anchors the resume log).
-        thread_num : int, default 5
-            Parallel download workers.
-        merge : str, default "monthly"
-            Merge policy recorded in the resume log.
-
-        Returns
-        -------
-        None
-        """
         if not isinstance(output_directory, Path):
             log_file = Path(output_directory)
         else:
@@ -1028,7 +774,7 @@ class SocketManager:
                     ds = xr.open_dataset(os.path.join(output_directory, name), engine="netcdf4")
                     lat = ds.lat
                     lon = ds.lon
-                    intact = bool((lat != 0).any() or (lon != 0).any())
+                    intact = bool(lat.size and lon.size and set(merra2_collection["var_name"]) <= set(ds.data_vars))
                     ds.close()
                 except Exception:
                     intact = False
@@ -1081,7 +827,7 @@ class SocketManager:
                             ds = xr.open_dataset(os.path.join(output_directory, name), engine="netcdf4")
                             lat = ds.lat
                             lon = ds.lon
-                            intact = bool((lat != 0).any() or (lon != 0).any())
+                            intact = bool(lat.size and lon.size and set(merra2_collection["var_name"]) <= set(ds.data_vars))
                             ds.close()
                         except Exception:
                             intact = False
@@ -1100,32 +846,6 @@ class SocketManager:
             logging.info("---- Download Finished ----")
 
     def merge_variables_perday(self, path_data: Union[str, Path], collection_names: List[str], final_year: int, final_month: int, final_day: int, date: datetime.date, map_variables: bool = True):
-        """
-        Merge the daily NetCDF files of one date into a single dataset.
-
-        Parameters
-        ----------
-        path_data : str or pathlib.Path
-            Directory searched recursively for ``*YYYYMMDD.nc4.nc`` files.
-        collection_names : list of str
-            Collections whose files participate in the merge.
-        final_year : int
-            Last year of the period used to build the output time range.
-        final_month : int
-            Last month of that period.
-        final_day : int
-            Last day of that period.
-        date : datetime.date
-            Day to merge; days without files are skipped.
-        map_variables : bool, default True
-            Rename variables to standard names in the merged output.
-
-        Returns
-        -------
-        delete_set : list of str
-            Paths of the consumed source files (removed by the caller after a
-            successful merge).
-        """
         if not isinstance(path_data, Path):
             path_data = Path(path_data)
 
@@ -1151,7 +871,7 @@ class SocketManager:
             with xr.open_dataset(name, engine="netcdf4") as source_ds:
                 remote_ds = source_ds.load()
             try:
-                final_ds = xr.merge([final_ds, remote_ds])
+                final_ds = xr.merge([final_ds, remote_ds], join="outer")
             except ValueError:
                 remote_ds.close()
                 raise RuntimeError("Corrupted file detected: {0}".format(os.path.split(name)[1]))
@@ -1178,32 +898,6 @@ class SocketManager:
         return delete_set
 
     def merge_variables_permonth(self, path_data: Union[str, Path], collection_names: List[str], final_year: int, final_month: int, final_day: int, date: str, map_variables: bool = True):
-        """
-        Merge the daily NetCDF files of one month into a single dataset.
-
-        Parameters
-        ----------
-        path_data : str or pathlib.Path
-            Directory searched recursively for ``*YYYY-MM-*.nc`` files.
-        collection_names : list of str
-            Collections whose files participate in the merge.
-        final_year : int
-            Last year of the period used to build the output time range.
-        final_month : int
-            Last month of that period.
-        final_day : int
-            Last day of that period.
-        date : str
-            Month to merge in ``YYYY-MM`` format; months without files are
-            skipped.
-        map_variables : bool, default True
-            Rename variables to standard names in the merged output.
-
-        Returns
-        -------
-        delete_set : list of str
-            Paths of the consumed source files.
-        """
         if not isinstance(path_data, Path):
             path_data = Path(path_data)
 
@@ -1249,31 +943,6 @@ class SocketManager:
         return delete_set
 
     def merge_variables_peryear(self, path_data: Union[str, Path], collection_names: List[str], final_year: int, final_month: int, final_day: int, date: str, map_variables: bool = True):
-        """
-        Merge the monthly NetCDF files of one year into a single dataset.
-
-        Parameters
-        ----------
-        path_data : str or pathlib.Path
-            Directory searched recursively for ``*YYYY-MM-*.nc`` files.
-        collection_names : list of str
-            Collections whose files participate in the merge.
-        final_year : int
-            Last year of the period used to build the output time range.
-        final_month : int
-            Last month of that period.
-        final_day : int
-            Last day of that period.
-        date : str
-            Year to merge; years without files are skipped.
-        map_variables : bool, default True
-            Rename variables to standard names in the merged output.
-
-        Returns
-        -------
-        delete_set : list of str
-            Paths of the consumed source files.
-        """
         if not isinstance(path_data, Path):
             path_data = Path(path_data)
 
@@ -1319,63 +988,6 @@ class SocketManager:
         return delete_set
 
     def daily_download_and_convert(self, collection_names: List[str], initial_year: int, final_year: Optional[int] = datetime.datetime.now().year, initial_month: int = 1, final_month: Optional[int] = datetime.datetime.now().month, initial_day: int = 1, final_day: Optional[int] = datetime.datetime.now().day, lat_1: Optional[float] = -90, lon_1: Optional[float] = -180, lat_2: Optional[float] = 90, lon_2: Optional[float] = 180, merra2_var_dicts: Optional[Dict[str, dict]] = None, output_dir: Union[str, Path] = None, auth: dict = None, merge_timelapse: str = "monthly", thread_num: Optional[int] = 5, map_variables: bool = True):
-        """
-        Download and convert an area subset of MERRA-2 collections.
-
-        End-to-end area workflow: download every daily granule in the date
-        range, then optionally merge per day/month/year. Up to three attempts
-        are made when the integrity check fails.
-
-        Parameters
-        ----------
-        collection_names : list of str
-            Collections to download.
-        initial_year : int
-            First year (with ``initial_month``/``initial_day``).
-        final_year : int, optional
-            Last year; defaults to the current year at import time.
-        initial_month : int, default 1
-            First month.
-        final_month : int, default 12
-            Last month.
-        initial_day : int, default 1
-            First day.
-        final_day : int, optional
-            Last day; defaults to today at import time.
-        lat_1 : float, default -90
-            First corner latitude [degrees].
-        lon_1 : float, default -180
-            First corner longitude [degrees].
-        lat_2 : float, default 90
-            Opposite corner latitude [degrees]; must satisfy ``lat_1 <= lat_2``.
-        lon_2 : float, default 180
-            Opposite corner longitude [degrees]; must satisfy ``lon_1 <= lon_2``.
-        merra2_var_dicts : dict, optional
-            Per-collection variable selections (built from the registry when
-            None).
-        output_dir : str or pathlib.Path, optional
-            Output root; defaults to the working directory.
-        auth : dict, optional
-            Earthdata credentials ``{"uid": ..., "password": ...}``.
-        merge_timelapse : str, default "monthly"
-            One of ``none``/``daily``/``monthly``/``yearly``.
-        thread_num : int, default 5
-            Parallel download workers.
-        map_variables : bool, default True
-            Rename variables during merging.
-
-        Returns
-        -------
-        str
-            Path of the dated subdirectory holding the downloaded (and merged)
-            NetCDF files.
-
-        Raises
-        ------
-        RuntimeError
-            For an illegal bounding box or merge policy, or after three failed
-            download attempts.
-        """
         if lat_1 > lat_2 or lon_1 > lon_2:
             raise RuntimeError("Illegal data area selected.")
         if merge_timelapse not in ["none", "daily", "monthly", "yearly"]:
@@ -1432,12 +1044,18 @@ class SocketManager:
                 else:
                     requested_params = [merra2_var_dict["var_name"]]
 
-                if merra2_var_dict["collection"].startswith("const"):
+                product = merra2_var_dict["collection"]
+                if product.startswith("const"):
                     requested_time = "[0:0]"
+                elif product == "tavg3_3d_cld_Np":
+                    requested_time = "[0:7]"
                 else:
                     requested_time = "[0:23]"
 
-                parameter = self.generate_url_params(requested_params, requested_time, requested_lat, requested_lon)
+                requested_levels = "[0:41]" if product == "tavg3_3d_cld_Np" else ""
+                parameter = self.generate_url_params(
+                    requested_params, requested_time, requested_lat, requested_lon, requested_levels
+                )
 
                 self.subdaily_universal_download(merra2_var_dict, initial_year, final_year, initial_month=initial_month, final_month=final_month, initial_day=initial_day, final_day=final_day, output_directory=temp_dir_download, auth=auth, params=parameter, thread_num=thread_num, merge=merge_timelapse)
 
@@ -1752,39 +1370,6 @@ class MERRA2CSVManager:
             ) from exc
 
     def download_collection_single_point(self, collection_name: str, lat: float, lon: float, start_time: pd.Timestamp, end_time: pd.Timestamp, variables=None):
-        """
-        Fetch one collection as a single-point CSV-ready time series.
-
-        Parameters
-        ----------
-        collection_name : str
-            Registry key (e.g. ``rad``); must support point mode.
-        lat : float
-            Point latitude [degrees], snapped to the nearest grid point.
-        lon : float
-            Point longitude [degrees], snapped to the nearest grid point.
-        start_time : pd.Timestamp
-            Inclusive range start (UTC).
-        end_time : pd.Timestamp
-            Inclusive range end (UTC).
-        variables : str, list or dict, optional
-            Variable subset; defaults to the collection's full variable list.
-
-        Returns
-        -------
-        data : pandas.DataFrame
-            Time-indexed variables for the matched grid point.
-        meta : dict
-            Coordinates (requested and matched), selected variables, units and
-            the covered range.
-
-        Raises
-        ------
-        ValueError
-            For unknown collections, or collections unsupported in point mode.
-        RuntimeError
-            When the request returns no records.
-        """
         if collection_name not in var_list:
             raise ValueError(f"Unsupported collection name: {collection_name}. Available collections are: {list(var_list.keys())}")
         if collection_name in POINT_UNSUPPORTED_COLLECTIONS:
@@ -1846,74 +1431,21 @@ class MERRA2CSVManager:
 # Public interface
 # =============================================================================
 
-def download_merra2(collection_names: Union[str, List[str]] = None, initial_year: Optional[int] = None, final_year: Optional[int] = None, initial_month: int = 1, final_month: int = 12, initial_day: int = 1, final_day: Optional[int] = None, lat_1: float = -90, lon_1: float = -180, lat_2: float = 90, lon_2: float = 180, lat: Optional[float] = None, lon: Optional[float] = None, mode: str = "area", start=None, end=None, variables=None, output_dir: Union[str, Path] = "MERRA2_data", save_path: Optional[Union[str, Path]] = None, auth: dict = None, username: str = None, password: str = None, merge_timelapse: str = "none", thread_num: int = 1, map_variables: bool = True, timeout: Tuple[int, int] = (30, 300)):
+def download_merra2(collection_names: Union[str, List[str]] = None, initial_year: Optional[int] = None, final_year: Optional[int] = None, initial_month: int = 1, final_month: int = 12, initial_day: int = 1, final_day: Optional[int] = None, lat_1: float = -90, lon_1: float = -180, lat_2: float = 90, lon_2: float = 180, lat: Optional[float] = None, lon: Optional[float] = None, mode: str = "area", start=None, end=None, variables=None, output_dir: Union[str, Path] = "MERRA2_data", save_path: Optional[Union[str, Path]] = None, auth: dict = None, username: str = None, password: str = None, merge_timelapse: str = "none", thread_num: int = 1, map_variables: bool = True, timeout: Tuple[int, int] = (30, 300), *, convert_units: bool = True):
     """
-    Unified MERRA2 downloader for gridded NetCDF subsets and single-point CSV time series.
+    Unified MERRA2 downloader.
 
-    mode="area" downloads NetCDF subset files by four area parameters (lat_1, lon_1, lat_2, lon_2); mode="point" downloads a single-point CSV time series by lat and lon.
+    mode="area"
+        Download NetCDF subsets for the bounding box. Standardized outputs preserve the
+        source time and vertical coordinates. Use convert_units=False for provider units.
 
-    Parameters
-    ----------
-    collection_names : str or list of str, optional
-        MERRA-2 collection(s) from the built-in registry (`rad`, `slv`, `aer`, `asm`, `dewpt`, `evspsbl`, `hur`, `huss`, `phis`, `pr`, `prc`, `prbc`, `prmax`, `prsn`, `rls`, `sftgif`, `sftkf`, `sftlf`, `sftof`, `shg`, `sic`, `tas`, `tasmax`, `tasmin`, `uas`, `vas`). Point mode defaults to `["rad", "slv", "aer"]`; area mode requires it explicitly (`ValueError`) to avoid huge default downloads.
-    initial_year : int, optional
-        First year. Required in area mode (`ValueError`); in point mode used only when `start`/`end` are not given.
-    final_year : int, optional
-        Last year; same rules as `initial_year`.
-    initial_month : int, default 1
-        First month of the year/month/day range.
-    final_month : int, default 12
-        Last month of the year/month/day range.
-    initial_day : int, default 1
-        First day of the year/month/day range.
-    final_day : int, optional
-        Last day. Required in area mode and whenever the year/month/day range form is used (`ValueError`).
-    lat_1 : float, default -90
-        Area corner latitude [degrees] (area mode); must satisfy `lat_1 <= lat_2` (`RuntimeError` otherwise).
-    lon_1 : float, default -180
-        Area corner longitude [degrees] (area mode); must satisfy `lon_1 <= lon_2` (`RuntimeError` otherwise).
-    lat_2 : float, default 90
-        Opposite area corner latitude [degrees] (area mode).
-    lon_2 : float, default 180
-        Opposite area corner longitude [degrees] (area mode).
-    lat : float, optional
-        Point latitude [degrees]. Required in point mode (`ValueError`).
-    lon : float, optional
-        Point longitude [degrees]. Required in point mode (`ValueError`).
-    mode : str, default "area"
-        `"area"` (NetCDF subset by four corners) or `"point"` (single-point CSV time series); `ValueError` otherwise.
-    start : Any, optional
-        Point-mode period start (e.g. `"YYYY-MM-DD"`); `start` and `end` must be given together. Date-only values start at 00:00:00 UTC.
-    end : Any, optional
-        Point-mode period end; date-only values extend to 23:59:59.
-    variables : sequence or dict, optional
-        Variable subset. A string or list is allowed for a single collection; with multiple collections pass a dict `{collection: ["VAR", ...]}` (`ValueError` otherwise). Names must exist in the collection's registry (`ValueError`).
-    output_dir : str or pathlib.Path, default "MERRA2_data"
-        Area-mode output directory (created if missing); downloads land in a dated subdirectory.
-    save_path : str or pathlib.Path, optional
-        Point mode: also write the resulting table to this CSV. Ignored in area mode.
-    auth : dict, optional
-        Earthdata credentials `{"uid": ..., "password": ...}`; alternative to `username`/`password`. Required in both modes (`ValueError` when absent).
-    username : str, optional
-        Earthdata Login username (combined with `password` into `auth`).
-    password : str, optional
-        Earthdata Login password.
-    merge_timelapse : str, default "none"
-        Area mode: `"none"`, `"daily"`, `"monthly"` or `"yearly"` — merge downloaded files afterwards (`RuntimeError` otherwise).
-    thread_num : int, default 1
-        Area mode: parallel download threads.
-    map_variables : bool, default True
-        Rename columns to standard names (`VARIABLE_MAP`).
-    timeout : tuple of float, default (30, 300)
-        Point mode: `(connect, read)` timeouts in seconds for OPeNDAP requests.
-
-    Returns
-    -------
-    Depends on `mode`: area mode returns `str` — the directory holding the downloaded (and merged) NetCDF files; point mode returns `(pandas.DataFrame, dict)` — the time-series table (with `time` as the first column) and metadata including per-variable units.
-
-    Notes
-    -----
-    Requires NASA Earthdata Login credentials. Area mode validates `collection_names`, `initial_year`, `final_year` and `final_day` up front (`ValueError`) and raises `RuntimeError` when the bounding box or `merge_timelapse` is invalid, or after three failed download retries.
+    mode="point"
+        Download single-point CSV time series by lat and lon. By default, mapped
+        outputs use degrees Celsius, hPa and mm/h for temperature, pressure and
+        water-equivalent fluxes. Radiation is already in W/m2. Set
+        convert_units=False to preserve product units with mapped names. With
+        map_variables=False, names and units stay native. Exported CSVs have a
+        JSON metadata sidecar.
     """
     if collection_names is None:
         if mode == "point":
@@ -1927,15 +1459,19 @@ def download_merra2(collection_names: Union[str, List[str]] = None, initial_year
     auth = _get_auth(auth=auth, username=username, password=password)
 
     if mode == "area":
-        return _download_merra2_area(collection_names=collection_names, initial_year=initial_year, final_year=final_year, initial_month=initial_month, final_month=final_month, initial_day=initial_day, final_day=final_day, lat_1=lat_1, lon_1=lon_1, lat_2=lat_2, lon_2=lon_2, variables=variables, output_dir=output_dir, auth=auth, merge_timelapse=merge_timelapse, thread_num=thread_num, map_variables=map_variables)
+        if start is not None or end is not None:
+            first, last = _resolve_date_range(start=start, end=end)
+            initial_year, initial_month, initial_day = first.year, first.month, first.day
+            final_year, final_month, final_day = last.year, last.month, last.day
+        return _download_merra2_area(collection_names=collection_names, initial_year=initial_year, final_year=final_year, initial_month=initial_month, final_month=final_month, initial_day=initial_day, final_day=final_day, lat_1=lat_1, lon_1=lon_1, lat_2=lat_2, lon_2=lon_2, variables=variables, output_dir=output_dir, auth=auth, merge_timelapse=merge_timelapse, thread_num=thread_num, map_variables=map_variables, convert_units=convert_units)
 
     if mode == "point":
-        return _download_merra2_point(collection_names=collection_names, start=start, end=end, initial_year=initial_year, final_year=final_year, initial_month=initial_month, final_month=final_month, initial_day=initial_day, final_day=final_day, lat=lat, lon=lon, variables=variables, save_path=save_path, auth=auth, map_variables=map_variables, timeout=timeout)
+        return _download_merra2_point(collection_names=collection_names, start=start, end=end, initial_year=initial_year, final_year=final_year, initial_month=initial_month, final_month=final_month, initial_day=initial_day, final_day=final_day, lat=lat, lon=lon, variables=variables, save_path=save_path, auth=auth, map_variables=map_variables, timeout=timeout, convert_units=convert_units)
 
     raise ValueError("mode must be either 'area' or 'point'.")
 
 
-def _download_merra2_area(collection_names, initial_year, final_year, initial_month=1, final_month=12, initial_day=1, final_day=None, lat_1=-90, lon_1=-180, lat_2=90, lon_2=180, variables=None, output_dir="MERRA2_data", auth=None, merge_timelapse="none", thread_num=1, map_variables=True):
+def _download_merra2_area(collection_names, initial_year, final_year, initial_month=1, final_month=12, initial_day=1, final_day=None, lat_1=-90, lon_1=-180, lat_2=90, lon_2=180, variables=None, output_dir="MERRA2_data", auth=None, merge_timelapse="none", thread_num=1, map_variables=True, convert_units=True):
     if initial_year is None or final_year is None:
         raise ValueError("initial_year and final_year must be provided in area mode.")
     if final_day is None:
@@ -1943,11 +1479,39 @@ def _download_merra2_area(collection_names, initial_year, final_year, initial_mo
 
     merra2_var_dicts = _build_merra2_var_dicts(collection_names, variables)
 
+    products = {}
+    selected = {}
+    for alias, spec in merra2_var_dicts.items():
+        first = products.setdefault(spec["esdt_dir"], alias)
+        if first == alias:
+            selected[alias] = spec
+        else:
+            variables = selected[first]["var_name"] + spec["var_name"]
+            selected[first]["var_name"] = list(dict.fromkeys(variables))
+    # Keep provider-format caches separate from standardized outputs.
+    suffix = ("standardized" if convert_units else "native") + ("_mapped" if map_variables else "")
     socket = SocketManager()
-    return socket.daily_download_and_convert(collection_names=collection_names, initial_year=initial_year, final_year=final_year, initial_month=initial_month, final_month=final_month, initial_day=initial_day, final_day=final_day, lat_1=lat_1, lon_1=lon_1, lat_2=lat_2, lon_2=lon_2, merra2_var_dicts=merra2_var_dicts, output_dir=output_dir, auth=auth, merge_timelapse=merge_timelapse, thread_num=thread_num, map_variables=map_variables)
+    directory = socket.daily_download_and_convert(collection_names=list(selected), initial_year=initial_year, final_year=final_year, initial_month=initial_month, final_month=final_month, initial_day=initial_day, final_day=final_day, lat_1=lat_1, lon_1=lon_1, lat_2=lat_2, lon_2=lon_2, merra2_var_dicts=selected, output_dir=Path(output_dir) / suffix, auth=auth, merge_timelapse=merge_timelapse, thread_num=thread_num, map_variables=False)
+    def standardize(files):
+        if convert_units:
+            ds, units = _standardize_area(files, map_variables)
+        else:
+            ds = _rename_dataset_with_variable_map(files[0])
+            units = {}
+        return ds.assign_attrs(irradpy2_units=suffix), units
+
+    if convert_units or map_variables:
+        for path in Path(directory).iterdir():
+            if path.suffix not in {".nc", ".nc4"}:
+                continue
+            with netCDF4.Dataset(path) as data:
+                if getattr(data, "irradpy2_units", None) == suffix:
+                    continue
+            _transform_netcdf_download(path, path, standardize)
+    return directory
 
 
-def _download_merra2_point(collection_names, start=None, end=None, initial_year=None, final_year=None, initial_month=1, final_month=12, initial_day=1, final_day=None, lat=None, lon=None, variables=None, save_path=None, auth=None, map_variables=True, timeout=(30, 300)):
+def _download_merra2_point(collection_names, start=None, end=None, initial_year=None, final_year=None, initial_month=1, final_month=12, initial_day=1, final_day=None, lat=None, lon=None, variables=None, save_path=None, auth=None, map_variables=True, timeout=(30, 300), *, convert_units=True):
     if lat is None or lon is None:
         raise ValueError("lat and lon must be provided in point mode.")
 
@@ -1977,20 +1541,36 @@ def _download_merra2_point(collection_names, start=None, end=None, initial_year=
     for meta_item in collection_meta.values():
         units.update(meta_item.get("units", {}))
 
-    meta = {"mode": "point", "requested_latitude": lat, "requested_longitude": lon, "start": str(start_time), "end": str(end_time), "collections": collection_names, "collection_meta": collection_meta, "units": units, "map_variables": map_variables}
+    meta = {"mode": "point", "requested_latitude": lat, "requested_longitude": lon, "start": str(start_time), "end": str(end_time), "collections": collection_names, "collection_meta": collection_meta, "units": units, "map_variables": map_variables, "convert_units": map_variables and convert_units}
 
     if map_variables:
         data = data.rename(columns=VARIABLE_MAP)
         mapped_units = {}
         for original_name, unit in units.items():
             mapped_units[VARIABLE_MAP.get(original_name, original_name)] = unit
+        if convert_units:
+            for name in _UNIT_CONVERSIONS.keys() & set(data.columns):
+                target, factor, offset = _normalize_units(name, mapped_units.get(name))
+                if factor != 1.0 or offset:
+                    data[name] = pd.to_numeric(data[name], errors="coerce") * factor + offset
+                mapped_units[name] = target
+            if "precipitation_rate" in data:
+                data["precipitation"] = data["precipitation_rate"]
+                mapped_units["precipitation"] = "mm"
         meta["units"] = mapped_units
+
+    if any(name in units for name in ("SWGDN", "SWGDNCLR")):
+        meta["irradiance_timing"] = POINT_RADIATION_TIMING.copy()
 
     if save_path is not None:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         data.to_csv(save_path, encoding="utf-8-sig", index=False)
+        metadata_path = save_path.with_name(f"{save_path.stem}_metadata.json")
+        with metadata_path.open("w", encoding="utf-8") as stream:
+            json.dump(meta, stream, indent=2, default=str)
 
+    data.attrs["units"] = dict(meta["units"])
     return data, meta
 
 
