@@ -22,6 +22,7 @@ import shutil
 import zipfile
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from hashlib import blake2b
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -216,30 +217,58 @@ def _write_netcdf(dataset, path):
     dataset.to_netcdf(path, engine="netcdf4", encoding=encoding)
 
 
+def _area_request_tag(*fields):
+    payload = json.dumps(fields, sort_keys=True, default=str).encode()
+    return blake2b(payload, digest_size=5).hexdigest()
+
+
+def _open_netcdf_parts(source, work, stack):
+    paths = [source]
+    if zipfile.is_zipfile(source):
+        paths = []
+        extracted = Path(stack.enter_context(TemporaryDirectory(dir=work)))
+        with zipfile.ZipFile(source) as archive:
+            for index, member in enumerate(archive.infolist()):
+                if member.is_dir() or Path(member.filename).suffix.lower() not in {".nc", ".netcdf", ".nc4"}:
+                    continue
+                path = extracted / f"source-{index}.nc"
+                with archive.open(member) as incoming, path.open("wb") as outgoing:
+                    shutil.copyfileobj(incoming, outgoing)
+                paths.append(path)
+        if not paths:
+            raise ValueError("The download archive did not contain any NetCDF files.")
+
+    datasets = []
+    for path in paths:
+        ds = stack.enter_context(xr.open_dataset(path, engine="netcdf4", cache=False))
+        # Keep string and object coordinates out of Dask's automatic chunk sizing.
+        datasets.append(ds.assign({
+            name: var.variable.chunk("auto")
+            for name, var in ds.data_vars.items()
+            if var.ndim and not var.dtype.hasobject
+        }))
+    return datasets
+
+
+def _concat_netcdf_time(datasets, time_dim):
+    if len(datasets) == 1:
+        return datasets[0]
+    combined = xr.concat(
+        datasets, dim=time_dim, data_vars="minimal", coords="minimal",
+        compat="equals", join="exact", combine_attrs="drop_conflicts",
+    ).sortby(time_dim)
+    if not combined.get_index(time_dim).is_unique:
+        raise ValueError(f"Overlapping timestamps in {time_dim} across NetCDF parts.")
+    return combined
+
+
 def _transform_netcdf_download(source, target, transform):
     """Convert a NetCDF response or a ZIP of NetCDF groups before publishing it."""
     target = Path(target)
     with TemporaryDirectory(dir=target.parent) as folder:
         work = Path(folder)
-        paths = [source]
-        if zipfile.is_zipfile(source):
-            with zipfile.ZipFile(source) as archive:
-                paths = []
-                for index, member in enumerate(archive.infolist()):
-                    if member.is_dir() or Path(member.filename).suffix.lower() not in {".nc", ".netcdf", ".nc4"}:
-                        continue
-                    path = work / f"source-{index}.nc"
-                    with archive.open(member) as incoming, path.open("wb") as outgoing:
-                        shutil.copyfileobj(incoming, outgoing)
-                    paths.append(path)
-            if not paths:
-                raise ValueError("The download archive did not contain any NetCDF files.")
-
         with ExitStack() as stack:
-            datasets = [
-                stack.enter_context(xr.open_dataset(path, engine="netcdf4", chunks="auto"))
-                for path in paths
-            ]
+            datasets = _open_netcdf_parts(source, work, stack)
             dataset, units = transform(datasets)
             staged = work / "output.nc"
             _write_netcdf(dataset, staged)
@@ -247,6 +276,24 @@ def _transform_netcdf_download(source, target, transform):
     if Path(source) != target:
         Path(source).unlink()
     return units
+
+
+def _append_grib_download(raw, output):
+    if zipfile.is_zipfile(raw):
+        with zipfile.ZipFile(raw) as archive:
+            members = [member for member in archive.infolist() if not member.is_dir()]
+            parts = [member for member in members if Path(member.filename).suffix.lower() in {".grib", ".grb", ".grib2", ".grb2"}]
+            if not parts:
+                if len(members) != 1:
+                    raise ValueError("The download archive did not contain GRIB files.")
+                parts = members
+            for part in parts:
+                with archive.open(part) as source:
+                    shutil.copyfileobj(source, output)
+    else:
+        with raw.open("rb") as source:
+            shutil.copyfileobj(source, output)
+    raw.unlink()
 
 
 def _to_utc_naive_timestamp(dt: Any) -> pd.Timestamp:
@@ -454,32 +501,32 @@ def download_era5_point(lat: float, lon: float, start: Any, end: Any, variables:
     if save_path.suffix.lower() != ".csv":
         save_path = save_path.with_suffix(".csv")
 
-    raw_download = save_path.with_name(save_path.stem + "__raw.download")
-    raw_csv = save_path.with_name(save_path.stem + "__raw.csv")
     metadata_path = save_path.with_name(save_path.stem + "_metadata.json")
 
     client = _build_client(api_url=api_url, api_key=api_key, quiet=quiet)
 
     request = {"variable": normalized_variables, "location": {"latitude": float(lat), "longitude": float(lon)}, "date": [f"{start_ts.strftime('%Y-%m-%d')}/{end_ts.strftime('%Y-%m-%d')}"], "data_format": "csv"}
 
-    _ensure_parent(raw_download)
-    client.retrieve(POINT_DATASET, request, str(raw_download))
+    _ensure_parent(save_path)
+    with TemporaryDirectory(prefix=".era5-", dir=save_path.parent) as folder:
+        work = Path(folder)
+        raw_download = work / "raw.download"
+        raw_csv = work / "raw.csv"
+        client.retrieve(POINT_DATASET, request, str(raw_download))
+        _extract_or_move_single_file(raw_path=raw_download, final_path=raw_csv, allowed_suffixes={".csv"})
+        data, parsed_meta = read_era5_point_csv(raw_csv, map_variables=map_variables, convert_units=convert_units)
 
-    _extract_or_move_single_file(raw_path=raw_download, final_path=raw_csv, allowed_suffixes={".csv"})
-
-    data, parsed_meta = read_era5_point_csv(raw_csv, map_variables=map_variables, convert_units=convert_units)
-
-    export_df = data.copy()
-    export_df.insert(0, "UTC_time", export_df.index.strftime("%Y-%m-%d %H:%M:%S"))
-    export_df = export_df.reset_index(drop=True)
-
-    ordered_cols = ["ghi", "bhi", "dhi", "longwave_down", "temp_air", "pressure", "cloud_fraction", "precipitation"]
-    existing_cols = [col for col in ordered_cols if col in export_df.columns]
-    other_cols = [col for col in export_df.columns if col not in existing_cols and col != "UTC_time"]
-    export_df = export_df[["UTC_time"] + existing_cols + other_cols]
-
-    export_df.to_csv(save_path, index=False, encoding="utf-8-sig")
-    raw_csv.unlink(missing_ok=True)
+        export_df = data.copy()
+        export_df.insert(0, "UTC_time", export_df.index.strftime("%Y-%m-%d %H:%M:%S"))
+        export_df = export_df.reset_index(drop=True)
+        ordered_cols = ["ghi", "bhi", "dhi", "longwave_down", "temp_air", "pressure", "cloud_fraction", "precipitation"]
+        existing_cols = [col for col in ordered_cols if col in export_df.columns]
+        other_cols = [col for col in export_df.columns if col not in existing_cols and col != "UTC_time"]
+        export_df = export_df[["UTC_time"] + existing_cols + other_cols]
+        staged = work / "output.csv"
+        export_df.to_csv(staged, index=False, encoding="utf-8-sig")
+        staged.replace(save_path)
+    parsed_meta["source_file"] = str(save_path)
 
     metadata: Dict[str, Any] = {"mode": "point", "dataset": POINT_DATASET, "request": request, "output_csv": str(save_path), "column_names": list(export_df.columns), "map_variables": map_variables, "convert_units": convert_units}
     metadata.update(parsed_meta)
@@ -525,7 +572,7 @@ def _standardize_area(datasets, map_variables, derive_dhi):
 
 
 def download_era5_area(lat_1: float, lon_1: float, lat_2: float, lon_2: float, start: Any, end: Any, variables: Optional[Sequence[str]] = None, output_dir: str | Path = "ERA5_data", file_prefix: Optional[str] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, quiet: bool = True, *, convert_units: bool = True, map_variables: bool = True) -> AreaResult:
-    """Download standardized NetCDF, or provider GRIB with convert_units=False."""
+    """Download a single regional NetCDF, or a GRIB stream with convert_units=False."""
     start_ts = _to_utc_naive_timestamp(start)
     end_ts = _to_utc_naive_timestamp(end)
 
@@ -556,51 +603,64 @@ def download_era5_area(lat_1: float, lon_1: float, lat_2: float, lon_2: float, s
     if file_prefix is None:
         file_prefix = _default_area_prefix(lat_1=lat_1, lon_1=lon_1, lat_2=lat_2, lon_2=lon_2)
 
-    metadata_path = output_dir / f"{file_prefix}_metadata.json"
     client = _build_client(api_url=api_url, api_key=api_key, quiet=quiet)
-
-    chunk_infos: List[Dict[str, Any]] = []
-    grib_paths: List[Path] = []
-    netcdf_paths: List[Path] = []
-    units: Dict[str, str] = {}
-    data_format = "netcdf" if convert_units else "grib"
-    suffix = ".nc" if convert_units else ".grib"
-
-    for chunk_start, chunk_end in _month_chunks(start_ts.normalize(), end_ts.normalize()):
-        year_str = f"{chunk_start.year:04d}"
-        month_str = f"{chunk_start.month:02d}"
-        days = [f"{day:02d}" for day in range(chunk_start.day, chunk_end.day + 1)]
-
-        request = {"product_type": "reanalysis", "variable": normalized_variables, "year": [year_str], "month": [month_str], "day": days, "time": ERA5_HOURS, "area": [north, west, south, east], "data_format": data_format}
-
-        part_name = f"{file_prefix}_{year_str}{month_str}{suffix}"
-        part_path = output_dir / part_name
-        raw_download = output_dir / f"{file_prefix}_{year_str}{month_str}__raw.download"
-
-        client.retrieve(AREA_DATASET, request, str(raw_download))
-        if convert_units:
-            units.update(_transform_netcdf_download(raw_download, part_path, lambda files: _standardize_area(files, map_variables, derive_dhi)))
-            netcdf_paths.append(part_path)
-        else:
-            _extract_or_move_single_file(raw_path=raw_download, final_path=part_path, allowed_suffixes={".grib", ".grb"})
-            grib_paths.append(part_path)
-        path_key = "netcdf_path" if convert_units else "grib_path"
-        chunk_infos.append({"chunk_start": chunk_start.strftime("%Y-%m-%d"), "chunk_end": chunk_end.strftime("%Y-%m-%d"), path_key: str(part_path), "request": request})
+    date_tag = f"{start_ts:%Y%m%d}_{end_ts:%Y%m%d}"
+    tag = _area_request_tag(north, west, south, east, sorted(normalized_variables), convert_units, map_variables, derive_dhi)
+    stem = f"{file_prefix}_{date_tag}_{tag}"
+    final_path = output_dir / f"{stem}{'.nc' if convert_units else '.grib'}"
+    metadata_path = output_dir / f"{stem}_metadata.json"
+    grib_paths = [] if convert_units else [final_path]
+    netcdf_paths = [final_path] if convert_units else []
 
     mapped_variables = [OUTPUT_VARIABLE_MAP.get(var, var) for var in normalized_variables]
-    if "dhi" in units:
-        mapped_variables.append("dhi")
-
-    metadata: Dict[str, Any] = {"mode": "area", "dataset": AREA_DATASET, "lat_1": lat_1, "lon_1": lon_1, "lat_2": lat_2, "lon_2": lon_2, "north": north, "south": south, "west": west, "east": east, "start_utc": start_ts.strftime("%Y-%m-%d %H:%M:%S"), "end_utc": end_ts.strftime("%Y-%m-%d %H:%M:%S"), "variables": normalized_variables, "mapped_variables": mapped_variables, "file_prefix": file_prefix, "grib_count": len(grib_paths), "grib_paths": [str(path) for path in grib_paths], "chunks": chunk_infos}
-
-    metadata.update({
+    metadata: Dict[str, Any] = {
+        "mode": "area", "dataset": AREA_DATASET, "lat_1": lat_1, "lon_1": lon_1,
+        "lat_2": lat_2, "lon_2": lon_2, "north": north, "south": south, "west": west, "east": east,
+        "start_utc": str(start_ts), "end_utc": str(end_ts), "variables": normalized_variables,
+        "mapped_variables": mapped_variables, "file_prefix": file_prefix,
+        "grib_count": len(grib_paths), "grib_paths": [str(path) for path in grib_paths],
+        "netcdf_count": len(netcdf_paths), "netcdf_paths": [str(path) for path in netcdf_paths],
         "output_representation": "standardized_netcdf" if convert_units else "provider_native",
-        "netcdf_paths": [str(path) for path in netcdf_paths],
-        "netcdf_count": len(netcdf_paths),
-        "units": units,
-        "radiation_timing": {"timestamp_label": "interval_end", "integration_seconds": 3600},
-    })
-    _write_json(metadata, metadata_path)
+        "units": {}, "radiation_timing": {"timestamp_label": "interval_end", "integration_seconds": 3600},
+        "chunks": [],
+    }
+    with TemporaryDirectory(prefix=".era5-", dir=output_dir) as folder, ExitStack() as stack:
+        work = Path(folder)
+        staged = work / final_path.name
+        datasets = []
+        grib = None if convert_units else stack.enter_context(staged.open("wb"))
+        for chunk_start, chunk_end in _month_chunks(start_ts.normalize(), end_ts.normalize()):
+            days = [f"{day:02d}" for day in range(chunk_start.day, chunk_end.day + 1)]
+            request = {
+                "product_type": "reanalysis", "variable": normalized_variables,
+                "year": [f"{chunk_start.year:04d}"], "month": [f"{chunk_start.month:02d}"],
+                "day": days, "time": ERA5_HOURS, "area": [north, west, south, east],
+                "data_format": "netcdf" if convert_units else "grib",
+            }
+            raw = work / f"{chunk_start:%Y%m}.download"
+            client.retrieve(AREA_DATASET, request, str(raw))
+            if convert_units:
+                dataset, units = _standardize_area(_open_netcdf_parts(raw, work, stack), map_variables, derive_dhi)
+                datasets.append(dataset)
+                metadata["units"].update(units)
+            else:
+                _append_grib_download(raw, grib)
+            metadata["chunks"].append({
+                "chunk_start": f"{chunk_start:%Y-%m-%d}", "chunk_end": f"{chunk_end:%Y-%m-%d}",
+                "netcdf_path" if convert_units else "grib_path": str(final_path), "request": request,
+            })
+
+        if convert_units:
+            if "dhi" in metadata["units"]:
+                mapped_variables.append("dhi")
+            time_dim = "valid_time" if "valid_time" in datasets[0].dims else "time"
+            data = _concat_netcdf_time(datasets, time_dim)
+            _write_netcdf(data, staged)
+        stack.close()
+        staged_meta = work / metadata_path.name
+        _write_json(metadata, staged_meta)
+        staged.replace(final_path)
+        staged_meta.replace(metadata_path)
 
     return AreaResult(grib_paths=grib_paths, metadata=metadata, metadata_path=metadata_path, netcdf_paths=netcdf_paths)
 

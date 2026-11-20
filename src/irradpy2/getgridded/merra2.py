@@ -17,6 +17,7 @@ post-processing should be placed in separate modules.
 import datetime
 import _thread
 import errno
+from contextlib import ExitStack
 import json
 import logging
 import multiprocessing
@@ -29,6 +30,7 @@ import urllib.request
 from functools import partial
 from http import cookiejar
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional, Tuple, Union
 
 import netCDF4
@@ -37,7 +39,10 @@ import pandas as pd
 import requests
 import xarray as xr
 
-from .era5 import _transform_netcdf_download, _netcdf_unit_key
+from .era5 import (
+    _area_request_tag, _concat_netcdf_time, _netcdf_unit_key, _open_netcdf_parts,
+    _write_json, _write_netcdf,
+)
 
 try:
     import earthaccess
@@ -771,11 +776,8 @@ class SocketManager:
             if name.endswith(".nc4.nc") and merra2_collection["collection"] in name and self.reconstruct_filename(name, params) + str(merge) not in log:
                 intact = False
                 try:
-                    ds = xr.open_dataset(os.path.join(output_directory, name), engine="netcdf4")
-                    lat = ds.lat
-                    lon = ds.lon
-                    intact = bool(lat.size and lon.size and set(merra2_collection["var_name"]) <= set(ds.data_vars))
-                    ds.close()
+                    with xr.open_dataset(os.path.join(output_directory, name), engine="netcdf4") as ds:
+                        intact = bool(ds.lat.size and ds.lon.size and set(merra2_collection["var_name"]) <= set(ds.data_vars))
                 except Exception:
                     intact = False
 
@@ -824,11 +826,8 @@ class SocketManager:
                         name = self.build_remote_filename(merra2_collection, dates[start:end][i], None)
                         intact = False
                         try:
-                            ds = xr.open_dataset(os.path.join(output_directory, name), engine="netcdf4")
-                            lat = ds.lat
-                            lon = ds.lon
-                            intact = bool(lat.size and lon.size and set(merra2_collection["var_name"]) <= set(ds.data_vars))
-                            ds.close()
+                            with xr.open_dataset(os.path.join(output_directory, name), engine="netcdf4") as ds:
+                                intact = bool(ds.lat.size and ds.lon.size and set(merra2_collection["var_name"]) <= set(ds.data_vars))
                         except Exception:
                             intact = False
 
@@ -1045,7 +1044,7 @@ class SocketManager:
                     requested_params = [merra2_var_dict["var_name"]]
 
                 product = merra2_var_dict["collection"]
-                if product.startswith("const"):
+                if product.startswith(("const", "statD")):
                     requested_time = "[0:0]"
                 elif product == "tavg3_3d_cld_Np":
                     requested_time = "[0:7]"
@@ -1431,13 +1430,16 @@ class MERRA2CSVManager:
 # Public interface
 # =============================================================================
 
-def download_merra2(collection_names: Union[str, List[str]] = None, initial_year: Optional[int] = None, final_year: Optional[int] = None, initial_month: int = 1, final_month: int = 12, initial_day: int = 1, final_day: Optional[int] = None, lat_1: float = -90, lon_1: float = -180, lat_2: float = 90, lon_2: float = 180, lat: Optional[float] = None, lon: Optional[float] = None, mode: str = "area", start=None, end=None, variables=None, output_dir: Union[str, Path] = "MERRA2_data", save_path: Optional[Union[str, Path]] = None, auth: dict = None, username: str = None, password: str = None, merge_timelapse: str = "none", thread_num: int = 1, map_variables: bool = True, timeout: Tuple[int, int] = (30, 300), *, convert_units: bool = True):
+def download_merra2(collection_names: Union[str, List[str]] = None, initial_year: Optional[int] = None, final_year: Optional[int] = None, initial_month: int = 1, final_month: int = 12, initial_day: int = 1, final_day: Optional[int] = None, lat_1: float = -90, lon_1: float = -180, lat_2: float = 90, lon_2: float = 180, lat: Optional[float] = None, lon: Optional[float] = None, mode: str = "area", start=None, end=None, variables=None, output_dir: Union[str, Path] = "MERRA2_data", save_path: Optional[Union[str, Path]] = None, auth: dict = None, username: str = None, password: str = None, merge_timelapse: str = "all", thread_num: int = 1, map_variables: bool = True, timeout: Tuple[int, int] = (30, 300), *, convert_units: bool = True):
     """
     Unified MERRA2 downloader.
 
     mode="area"
-        Download NetCDF subsets for the bounding box. Standardized outputs preserve the
-        source time and vertical coordinates. Use convert_units=False for provider units.
+        Download the bounding box into one NetCDF by default and return its directory.
+        When collections have different time axes, they keep separate dimensions.
+        The legacy merge_timelapse argument is accepted for compatibility; the
+        public area downloader always writes one file. Use convert_units=False
+        for provider units.
 
     mode="point"
         Download single-point CSV time series by lat and lon. By default, mapped
@@ -1471,7 +1473,7 @@ def download_merra2(collection_names: Union[str, List[str]] = None, initial_year
     raise ValueError("mode must be either 'area' or 'point'.")
 
 
-def _download_merra2_area(collection_names, initial_year, final_year, initial_month=1, final_month=12, initial_day=1, final_day=None, lat_1=-90, lon_1=-180, lat_2=90, lon_2=180, variables=None, output_dir="MERRA2_data", auth=None, merge_timelapse="none", thread_num=1, map_variables=True, convert_units=True):
+def _download_merra2_area(collection_names, initial_year, final_year, initial_month=1, final_month=12, initial_day=1, final_day=None, lat_1=-90, lon_1=-180, lat_2=90, lon_2=180, variables=None, output_dir="MERRA2_data", auth=None, merge_timelapse="all", thread_num=1, map_variables=True, convert_units=True):
     if initial_year is None or final_year is None:
         raise ValueError("initial_year and final_year must be provided in area mode.")
     if final_day is None:
@@ -1488,27 +1490,72 @@ def _download_merra2_area(collection_names, initial_year, final_year, initial_mo
         else:
             variables = selected[first]["var_name"] + spec["var_name"]
             selected[first]["var_name"] = list(dict.fromkeys(variables))
-    # Keep provider-format caches separate from standardized outputs.
-    suffix = ("standardized" if convert_units else "native") + ("_mapped" if map_variables else "")
-    socket = SocketManager()
-    directory = socket.daily_download_and_convert(collection_names=list(selected), initial_year=initial_year, final_year=final_year, initial_month=initial_month, final_month=final_month, initial_day=initial_day, final_day=final_day, lat_1=lat_1, lon_1=lon_1, lat_2=lat_2, lon_2=lon_2, merra2_var_dicts=selected, output_dir=Path(output_dir) / suffix, auth=auth, merge_timelapse=merge_timelapse, thread_num=thread_num, map_variables=False)
-    def standardize(files):
-        if convert_units:
-            ds, units = _standardize_area(files, map_variables)
-        else:
-            ds = _rename_dataset_with_variable_map(files[0])
-            units = {}
-        return ds.assign_attrs(irradpy2_units=suffix), units
+    if merge_timelapse not in {"all", "none", "daily", "monthly", "yearly"}:
+        raise ValueError("merge_timelapse must be 'all', 'none', 'daily', 'monthly' or 'yearly'.")
 
-    if convert_units or map_variables:
-        for path in Path(directory).iterdir():
-            if path.suffix not in {".nc", ".nc4"}:
-                continue
-            with netCDF4.Dataset(path) as data:
-                if getattr(data, "irradpy2_units", None) == suffix:
-                    continue
-            _transform_netcdf_download(path, path, standardize)
-    return directory
+    first = datetime.date(initial_year, initial_month, initial_day)
+    last = datetime.date(final_year, final_month, final_day)
+    if last < first:
+        raise ValueError("end must be later than or equal to start.")
+    if not selected:
+        raise ValueError("At least one MERRA-2 area collection must be requested.")
+
+    metadata = {
+        "mode": "area", "dataset": "MERRA-2", "start_utc": first.isoformat(), "end_utc": last.isoformat(),
+        "area": [lat_1, lon_1, lat_2, lon_2],
+        "collections": {spec["collection"]: sorted(spec["var_name"]) for spec in selected.values()},
+        "convert_units": convert_units, "map_variables": map_variables,
+    }
+    key = _area_request_tag(metadata)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / f"merra2_{first:%Y%m%d}_{last:%Y%m%d}_{key}"
+    socket = SocketManager()
+
+    with TemporaryDirectory(prefix=".merra2-", dir=output_dir) as folder:
+        work = Path(folder)
+        directory = Path(socket.daily_download_and_convert(
+            collection_names=list(selected), initial_year=initial_year, final_year=final_year,
+            initial_month=initial_month, final_month=final_month, initial_day=initial_day, final_day=final_day,
+            lat_1=lat_1, lon_1=lon_1, lat_2=lat_2, lon_2=lon_2, merra2_var_dicts=selected, output_dir=work,
+            auth=auth, merge_timelapse="none",
+            thread_num=thread_num, map_variables=False,
+        ))
+
+        staged = work / "merra2.nc"
+        with ExitStack() as stack:
+            datasets = []
+            sources = metadata["collections"]
+            mixed_time = len({collection.split("_")[0] for collection in sources}) > 1
+            time_names = {
+                "tavg3": "time_3h", "inst1": "time_instant",
+                "statD": "time_daily", "const": "time_static",
+            }
+            for collection in sources:
+                paths = sorted(directory.glob(f"*.{collection}.*.nc*"), key=lambda path: path.name.split(".")[2])
+                if not paths:
+                    raise RuntimeError(f"MERRA-2 returned no NetCDF files for {collection}.")
+                parts = [ds for path in paths for ds in _open_netcdf_parts(path, work, stack)]
+                dataset = _concat_netcdf_time(parts, "time")
+                if convert_units:
+                    dataset, _ = _standardize_area([dataset], map_variables)
+                elif map_variables:
+                    dataset = _rename_dataset_with_variable_map(dataset)
+                time_name = time_names.get(collection.split("_")[0], "time")
+                if mixed_time and time_name != "time" and "time" in dataset.dims:
+                    dataset = dataset.rename({"time": time_name})
+                datasets.append(dataset)
+
+            data = xr.merge(datasets, join="exact", compat="no_conflicts", combine_attrs="drop_conflicts")
+            metadata["units"] = {name: var.attrs["units"] for name, var in data.data_vars.items() if "units" in var.attrs}
+            _write_netcdf(data, staged)
+
+        staged_meta = work / "merra2_metadata.json"
+        _write_json(metadata, staged_meta)
+        destination.mkdir(parents=True, exist_ok=True)
+        staged.replace(destination / staged.name)
+        staged_meta.replace(destination / staged_meta.name)
+    return str(destination)
 
 
 def _download_merra2_point(collection_names, start=None, end=None, initial_year=None, final_year=None, initial_month=1, final_month=12, initial_day=1, final_day=None, lat=None, lon=None, variables=None, save_path=None, auth=None, map_variables=True, timeout=(30, 300), *, convert_units=True):

@@ -28,16 +28,21 @@ from __future__ import annotations
 import json
 import shutil
 import zipfile
+from contextlib import ExitStack
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cdsapi
 import pandas as pd
 import xarray as xr
 
-from .era5 import _transform_netcdf_download, _netcdf_unit_key
+from .era5 import (
+    _area_request_tag, _concat_netcdf_time, _netcdf_unit_key, _open_netcdf_parts,
+    _transform_netcdf_download, _write_netcdf,
+)
 
 
 ADS_API_URL = "https://ads.atmosphere.copernicus.eu/api"
@@ -45,6 +50,8 @@ ADS_API_URL = "https://ads.atmosphere.copernicus.eu/api"
 POINT_DATASET = "cams-solar-radiation-timeseries"
 AREA_DATASET = "cams-gridded-solar-radiation"
 AREA_VERSION = "4.6"
+_AREA_REVISED_VERSION = "4.6_rev2"
+_AREA_VERSION_LAST_YEAR = {AREA_VERSION: 2023, _AREA_REVISED_VERSION: 2025}
 
 DEFAULT_AREA_VARIABLES = ["ghi", "dni", "dhi"]
 
@@ -330,10 +337,11 @@ def _netcdf_integration_hours(ds, time_step, start):
     return pd.Timedelta(time_step) / pd.Timedelta(hours=1)
 
 
-def _standardize_netcdf(datasets, time_step, *, start=None, map_variables=True, time_ref="UT"):
-    ds = xr.merge(datasets, compat="no_conflicts", combine_attrs="drop_conflicts")
+def _standardize_netcdf(datasets, time_step, *, start=None, map_variables=True, time_ref="UT", join="outer"):
+    ds = xr.merge(datasets, compat="no_conflicts", join=join, combine_attrs="drop_conflicts")
     names = {name.lower(): alias for name, alias in VARIABLE_MAP.items()}
     names.update({name: alias for alias, name in AREA_VARIABLE_MAP.items()})
+    names.update({"beam_normal_irradiation": "dni", "beam_horizontal_irradiation": "bhi"})
     names.update({name: name for name in RADIATION_COLUMNS})
     hours = None
     rename = {}
@@ -384,13 +392,13 @@ def _build_point_request(lat: float, lon: float, start: Any, end: Any, file_form
     return request
 
 
-def _build_area_request(year: int, month: int, variable: str, sky_type: str, area: Optional[Sequence[float]] = None) -> Dict[str, Any]:
+def _build_area_request(year: int, month: int, variable: str, sky_type: str, area: Optional[Sequence[float]] = None, *, version: str = AREA_VERSION) -> Dict[str, Any]:
     if sky_type not in {"clear", "observed_cloud"}:
         raise ValueError("sky_type must be 'clear' or 'observed_cloud'.")
     if month < 1 or month > 12:
         raise ValueError("month must be between 1 and 12.")
 
-    request: Dict[str, Any] = {"variable": [variable], "sky_type": [sky_type], "version": [AREA_VERSION], "year": [f"{year:04d}"], "month": [f"{month:02d}"]}
+    request: Dict[str, Any] = {"variable": [variable], "sky_type": [sky_type], "version": [version], "year": [f"{year:04d}"], "month": [f"{month:02d}"]}
 
     if area is not None:
         if len(area) != 4:
@@ -416,59 +424,68 @@ def download_cams_point(lat: float, lon: float, start: Any, end: Any, save_path:
         save_path = save_path.with_suffix(".nc")
         allowed_suffixes = {".nc", ".netcdf"}
 
-    raw_download = save_path.with_name(save_path.stem + "__raw.download")
     metadata_path = save_path.with_name(save_path.stem + "_metadata.json")
 
     client = _build_client(api_url=api_url, api_key=api_key, quiet=quiet)
     request = _build_point_request(lat=lat, lon=lon, start=start, end=end, file_format=file_format, sky_type=sky_type, time_step=time_step, time_ref=time_ref, altitude=altitude)
 
-    _ensure_parent(raw_download)
-    client.retrieve(POINT_DATASET, request, str(raw_download))
-
-    data: Optional[pd.DataFrame] = None
-    parsed_meta: Dict[str, Any] = {}
-    if file_format == "netcdf" and convert_units:
-        final_path = save_path
-        parsed_meta["units"] = _transform_netcdf_download(
-            raw_download, final_path, lambda files: _standardize_netcdf(
-                files, time_step, start=start, map_variables=map_variables, time_ref=time_ref
+    _ensure_parent(save_path)
+    with TemporaryDirectory(prefix=".cams-", dir=save_path.parent) as folder:
+        work = Path(folder)
+        raw_download = work / "raw.download"
+        staged = work / save_path.name
+        client.retrieve(POINT_DATASET, request, str(raw_download))
+        data: Optional[pd.DataFrame] = None
+        parsed_meta: Dict[str, Any] = {}
+        if file_format == "netcdf" and convert_units:
+            parsed_meta["units"] = _transform_netcdf_download(
+                raw_download, staged, lambda files: _standardize_netcdf(
+                    files, time_step, start=start, map_variables=map_variables, time_ref=time_ref
+                )
             )
-        )
-    else:
-        final_path = _extract_or_move_single_file(
-            raw_path=raw_download, final_path=save_path, allowed_suffixes=allowed_suffixes
-        )
+        else:
+            _extract_or_move_single_file(raw_path=raw_download, final_path=staged, allowed_suffixes=allowed_suffixes)
 
-    if file_format == "csv" and parse_csv:
-        data, parsed_meta = read_cams_point_csv(
-            final_path, map_variables=map_variables, convert_units=convert_units, time_ref=time_ref
-        )
+        if file_format == "csv" and parse_csv:
+            data, parsed_meta = read_cams_point_csv(
+                staged, map_variables=map_variables, convert_units=convert_units, time_ref=time_ref
+            )
 
-        export_df = data.copy()
-        time_column = "UTC_time" if time_ref == "UT" else "solar_time"
-        export_df.insert(0, time_column, data.index.strftime("%Y-%m-%d %H:%M:%S"))
-        export_df = export_df.reset_index(drop=True)
+            export_df = data.copy()
+            time_column = "UTC_time" if time_ref == "UT" else "solar_time"
+            export_df.insert(0, time_column, data.index.strftime("%Y-%m-%d %H:%M:%S"))
+            export_df = export_df.reset_index(drop=True)
 
-        ordered_cols = ["ghi", "dni", "dhi", "ghi_clear", "dni_clear", "dhi_clear", "bhi", "bhi_clear"]
-        existing_cols = [col for col in ordered_cols if col in export_df.columns]
-        other_cols = [col for col in export_df.columns if col not in existing_cols and col != time_column]
-        export_df = export_df[[time_column] + existing_cols + other_cols]
+            ordered_cols = ["ghi", "dni", "dhi", "ghi_clear", "dni_clear", "dhi_clear", "bhi", "bhi_clear"]
+            existing_cols = [col for col in ordered_cols if col in export_df.columns]
+            other_cols = [col for col in export_df.columns if col not in existing_cols and col != time_column]
+            export_df = export_df[[time_column] + existing_cols + other_cols]
 
-        export_df.to_csv(final_path, index=False, encoding="utf-8-sig")
-        data = export_df
+            export_df.to_csv(staged, index=False, encoding="utf-8-sig")
+            data = export_df
+        staged.replace(save_path)
+    if data is not None:
+        parsed_meta["source_file"] = str(save_path)
 
-    metadata: Dict[str, Any] = {"mode": "point", "dataset": POINT_DATASET, "request": request, "output_file": str(final_path), "file_format": file_format, "sky_type": sky_type, "time_step": time_step, "time_ref": time_ref, "parse_csv": parse_csv, "map_variables": map_variables}
+    metadata: Dict[str, Any] = {"mode": "point", "dataset": POINT_DATASET, "request": request, "output_file": str(save_path), "file_format": file_format, "sky_type": sky_type, "time_step": time_step, "time_ref": time_ref, "parse_csv": parse_csv, "map_variables": map_variables}
     metadata.update(parsed_meta)
     metadata["convert_units"] = convert_units
     metadata["output_representation"] = "parsed_csv" if data is not None else "standardized_netcdf" if parsed_meta else "provider_native"
 
     _write_json(metadata, metadata_path)
 
-    return CamsPointResult(data=data, metadata=metadata, data_path=final_path, metadata_path=metadata_path)
+    return CamsPointResult(data=data, metadata=metadata, data_path=save_path, metadata_path=metadata_path)
 
 
-def download_cams_area(lat_1: Optional[float] = None, lon_1: Optional[float] = None, lat_2: Optional[float] = None, lon_2: Optional[float] = None, start: Any = None, end: Any = None, variables: Optional[Sequence[str]] = None, sky_type: str = "observed_cloud", output_dir: str | Path = "CAMS_data", quiet: bool = True, file_prefix: Optional[str] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, *, convert_units: bool = True, map_variables: bool = True) -> CamsAreaResult:
-    """Download gridded CAMS irradiation as W/m2 in NetCDF by default."""
+def download_cams_area(lat_1: Optional[float] = None, lon_1: Optional[float] = None, lat_2: Optional[float] = None, lon_2: Optional[float] = None, start: Any = None, end: Any = None, variables: Optional[Sequence[str]] = None, sky_type: str = "observed_cloud", output_dir: str | Path = "CAMS_data", quiet: bool = True, file_prefix: Optional[str] = None, api_url: Optional[str] = None, api_key: Optional[str] = None, *, convert_units: bool = True, map_variables: bool = True, version: Optional[str] = None) -> CamsAreaResult:
+    """Download one gridded CAMS NetCDF for the requested UTC dates, inclusive.
+
+    The 15-minute intervals are labeled at their end. With convert_units=False,
+    the combined file retains provider variable names and units.
+
+    By default, use 4.6 for requests through 2023 and 4.6_rev2 for later years.
+    One version applies to the entire date range.
+    """
     if start is None or end is None:
         raise ValueError("start and end must be provided in area mode.")
 
@@ -477,6 +494,14 @@ def download_cams_area(lat_1: Optional[float] = None, lon_1: Optional[float] = N
 
     if end_ts < start_ts:
         raise ValueError("end must be later than or equal to start.")
+
+    if version is None:
+        version = AREA_VERSION if end_ts.year <= _AREA_VERSION_LAST_YEAR[AREA_VERSION] else _AREA_REVISED_VERSION
+    if version not in _AREA_VERSION_LAST_YEAR:
+        raise ValueError(f"CAMS area version must be one of {list(_AREA_VERSION_LAST_YEAR)}.")
+    last_year = _AREA_VERSION_LAST_YEAR[version]
+    if start_ts.year < 2005 or end_ts.year > last_year:
+        raise ValueError(f"CAMS gridded version {version} covers 2005–{last_year}. Check the requested dates.")
 
     area = None
     if None not in [lat_1, lon_1, lat_2, lon_2]:
@@ -496,41 +521,75 @@ def download_cams_area(lat_1: Optional[float] = None, lon_1: Optional[float] = N
         else:
             file_prefix = "cams_area"
 
+    if not normalized_variables:
+        raise ValueError("At least one CAMS area variable must be requested.")
     client = _build_client(api_url=api_url, api_key=api_key, quiet=quiet)
 
-    netcdf_paths: List[Path] = []
-    chunk_requests: List[Dict[str, Any]] = []
-    units: Dict[str, str] = {}
+    first_day = start_ts.normalize()
+    last_day = end_ts.normalize()
+    end_boundary = last_day + pd.Timedelta(days=1)
+    date_tag = f"{first_day:%Y%m%d}_{last_day:%Y%m%d}"
+    tag = _area_request_tag(area, sorted(normalized_variables), sky_type, version, convert_units, map_variables)
+    stem = f"{file_prefix}_{date_tag}_{tag}"
+    final_path = output_dir / f"{stem}.nc"
+    metadata_path = output_dir / f"{stem}_metadata.json"
+    variable_names = {value: key for key, value in AREA_VARIABLE_MAP.items()}
+    metadata: Dict[str, Any] = {
+        "mode": "area", "dataset": AREA_DATASET, "start_utc": str(start_ts), "end_utc": str(end_ts),
+        "variables": normalized_variables, "sky_type": sky_type, "area": area, "gridded_version": version,
+        "netcdf_count": 1, "netcdf_paths": [str(final_path)], "requests": [],
+        "output_representation": "standardized_netcdf" if convert_units else "native_units_netcdf",
+        "radiation_timing": {"timestamp_label": "interval_end", "integration_seconds": 900},
+    }
 
-    for variable in normalized_variables:
-        for year, month in _month_keys(start_ts, end_ts):
-            request = _build_area_request(year=year, month=month, variable=variable, sky_type=sky_type, area=area)
-
-            stem = f"{file_prefix}_{variable}_{year:04d}{month:02d}"
-            raw_download = output_dir / f"{stem}__raw.download"
-            final_path = output_dir / f"{stem}.nc"
-
-            client.retrieve(AREA_DATASET, request, str(raw_download))
+    with TemporaryDirectory(prefix=".cams-", dir=output_dir) as folder, ExitStack() as stack:
+        work = Path(folder)
+        months = []
+        for year, month in _month_keys(first_day, last_day):
+            parts = []
+            for index, variable in enumerate(normalized_variables):
+                request = _build_area_request(year=year, month=month, variable=variable, sky_type=sky_type, area=area, version=version)
+                raw = work / f"{year:04d}{month:02d}_{index}.download"
+                client.retrieve(AREA_DATASET, request, str(raw))
+                parts.extend(_open_netcdf_parts(raw, work, stack))
+                metadata["requests"].append({
+                    "variable": variable, "year": year, "month": month, "request": request,
+                    "output_file": str(final_path),
+                })
             if convert_units:
-                units.update(_transform_netcdf_download(
-                    raw_download, final_path, lambda files: _standardize_netcdf(files, "15min", map_variables=map_variables)
-                ))
+                ds, _ = _standardize_netcdf(parts, "15min", map_variables=map_variables, join="exact")
             else:
-                _extract_or_move_single_file(raw_path=raw_download, final_path=final_path, allowed_suffixes={".nc", ".netcdf"})
+                ds = xr.merge(parts, compat="no_conflicts", join="exact", combine_attrs="drop_conflicts")
+            time_name = next((name for name in ("time", "valid_time", "Time") if name in ds.dims), None)
+            if time_name is None:
+                raise ValueError("CAMS area response has no time dimension.")
+            if time_name != "time":
+                ds = ds.rename({time_name: "time"})
+            times = ds.get_index("time")
+            if not times.is_unique or not times.is_monotonic_increasing:
+                raise ValueError("CAMS area timestamps must be unique and increasing.")
+            first_index, last_index = times.searchsorted([first_day, end_boundary], side="right")
+            months.append(ds.isel(time=slice(first_index, last_index)))
 
-            netcdf_paths.append(final_path)
-            chunk_requests.append({"variable": variable, "year": year, "month": month, "request": request, "output_file": str(final_path)})
+        data = _concat_netcdf_time(months, "time")
+        if not data.sizes["time"]:
+            raise ValueError("CAMS area response contains no intervals for the requested UTC dates.")
+        metadata["data_start_utc"] = str(data.get_index("time")[0])
+        metadata["data_end_utc"] = str(data.get_index("time")[-1])
+        metadata["units"] = {name: var.attrs["units"] for name, var in data.data_vars.items() if "units" in var.attrs}
+        metadata["mapped_variables"] = [
+            variable_names.get(name, name) for name in normalized_variables
+            if variable_names.get(name, name) in data.data_vars
+        ]
+        staged = work / final_path.name
+        _write_netcdf(data, staged)
+        stack.close()
+        staged_meta = work / metadata_path.name
+        _write_json(metadata, staged_meta)
+        staged.replace(final_path)
+        staged_meta.replace(metadata_path)
 
-    metadata_path = output_dir / f"{file_prefix}_metadata.json"
-    mapped_variables = [key for key, value in AREA_VARIABLE_MAP.items() if value in normalized_variables]
-
-    metadata: Dict[str, Any] = {"mode": "area", "dataset": AREA_DATASET, "start_utc": start_ts.strftime("%Y-%m-%d %H:%M:%S"), "end_utc": end_ts.strftime("%Y-%m-%d %H:%M:%S"), "variables": normalized_variables, "mapped_variables": mapped_variables, "sky_type": sky_type, "area": area, "gridded_version": AREA_VERSION, "netcdf_count": len(netcdf_paths), "netcdf_paths": [str(path) for path in netcdf_paths], "requests": chunk_requests}
-
-    metadata["output_representation"] = "standardized_netcdf" if convert_units else "provider_native"
-    metadata["units"] = units
-    _write_json(metadata, metadata_path)
-
-    return CamsAreaResult(netcdf_paths=netcdf_paths, metadata=metadata, metadata_path=metadata_path)
+    return CamsAreaResult(netcdf_paths=[final_path], metadata=metadata, metadata_path=metadata_path)
 
 
 def download_cams(mode: str = "point", quiet: bool = True, api_url: Optional[str] = None, api_key: Optional[str] = None, **kwargs: Any) -> CamsPointResult | CamsAreaResult:
@@ -548,7 +607,7 @@ def download_cams(mode: str = "point", quiet: bool = True, api_url: Optional[str
             if key not in kwargs:
                 raise ValueError(f"mode='area' requires keyword argument: {key}")
 
-        return download_cams_area(lat_1=kwargs.get("lat_1"), lon_1=kwargs.get("lon_1"), lat_2=kwargs.get("lat_2"), lon_2=kwargs.get("lon_2"), start=kwargs["start"], end=kwargs["end"], variables=kwargs.get("variables"), sky_type=kwargs.get("sky_type", "observed_cloud"), output_dir=kwargs.get("output_dir", "CAMS_data"), quiet=quiet, file_prefix=kwargs.get("file_prefix"), api_url=api_url, api_key=api_key, convert_units=kwargs.get("convert_units", True), map_variables=kwargs.get("map_variables", True))
+        return download_cams_area(lat_1=kwargs.get("lat_1"), lon_1=kwargs.get("lon_1"), lat_2=kwargs.get("lat_2"), lon_2=kwargs.get("lon_2"), start=kwargs["start"], end=kwargs["end"], variables=kwargs.get("variables"), sky_type=kwargs.get("sky_type", "observed_cloud"), output_dir=kwargs.get("output_dir", "CAMS_data"), quiet=quiet, file_prefix=kwargs.get("file_prefix"), api_url=api_url, api_key=api_key, convert_units=kwargs.get("convert_units", True), map_variables=kwargs.get("map_variables", True), version=kwargs.get("version"))
 
     raise ValueError("mode must be either 'point' or 'area'.")
 
